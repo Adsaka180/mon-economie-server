@@ -13,103 +13,176 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    transports: ['websocket']
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || "secret_super_securise_999";
+const JWT_SECRET = process.env.JWT_SECRET || "super_secret_key";
 
-// --- STOCKAGE EN MÉMOIRE (FIABLE ET RAPIDE) ---
+// --- DONNÉES EN MÉMOIRE ---
 let users = [];
 let products = [
-    { id: "p1", name: "Pack de démarrage", description: "Idéal pour débuter l'aventure", price: 100, stock: 99, category: "Général" },
-    { id: "p2", name: "Grade VIP", description: "Badge doré sur le profil", price: 5000, stock: 10, category: "Spécial" },
-    { id: "p3", name: "Épée en Diamant", description: "Objet de collection rarissime", price: 50000, stock: 1, category: "Légendaire" }
+    { id: "p1", name: "Pack Fondateur", description: "Un pack exclusif pour les premiers arrivés.", price: 0, stock: 100, category: "Événement", imageUrl: "https://cdn-icons-png.flaticon.com/512/1063/1063376.png" },
+    { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: 10, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png" },
+    { id: "p3", name: "Lingot d'Or", description: "Valeur refuge.", price: 5000, stock: 50, category: "Ressources", imageUrl: "https://cdn-icons-png.flaticon.com/512/2481/2481134.png" }
 ];
+let messages = [];
+let logs = [];
+let transactions = [];
 
-// Création automatique du compte admin
+// --- LOGIQUE ADMIN ---
 async function initAdmin() {
     const hashedPassword = await bcrypt.hash("admin123", 10);
-    users.push({
-        id: "admin-static-id",
-        username: "admin",
-        password: hashedPassword,
-        balance: 1000000.0,
-        role: "SUPER_ADMIN",
-        level: 100,
-        reputation: 100,
-        xp: 0,
-        title: "Fondateur"
-    });
-    console.log("👑 Compte Admin prêt : admin / admin123");
+    const admin = {
+        id: "admin-id", username: "admin", password: hashedPassword,
+        balance: 1000000, role: "SUPER_ADMIN", level: 100, xp: 0, reputation: 100, title: "Créateur", isBanned: false
+    };
+    users.push(admin);
 }
 initAdmin();
 
-// --- ROUTES AUTHENTIFICATION ---
+function addLog(action, details) {
+    const log = { id: uuidv4(), action, details, timestamp: Date.now() };
+    logs.unshift(log);
+    if (logs.length > 100) logs.pop();
+    io.to('admins').emit('new_log', log);
+}
+
+// --- ROUTES API ---
 app.post('/register', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Champs requis" });
-    if (users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
-        return res.status(400).json({ error: "Ce nom est déjà pris" });
-    }
-
+    if (users.find(u => u.username === username)) return res.status(400).json({ error: "Pseudo déjà pris" });
     const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = {
-        id: uuidv4(), username, password: hashedPassword,
-        balance: 1000.0, role: 'USER', level: 1, xp: 0, reputation: 0, title: "Nouveau"
+    const user = {
+        id: uuidv4(), username, password: hashedPassword, balance: 1000,
+        role: 'USER', level: 1, xp: 0, reputation: 0, title: "Nouveau", isBanned: false
     };
-    users.push(newUser);
-
-    const token = jwt.sign({ userId: newUser.id }, JWT_SECRET);
-    res.json({ token, user: newUser });
+    users.push(user);
+    addLog("Register", `Nouvel utilisateur: ${username}`);
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET);
+    res.json({ token, user });
 });
 
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
-    const user = users.find(u => u.username.toLowerCase() === username.toLowerCase());
-
-    if (user && await bcrypt.compare(password, user.password)) {
+    const user = users.find(u => u.username === username);
+    if (user && !user.isBanned && await bcrypt.compare(password, user.password)) {
         const token = jwt.sign({ userId: user.id }, JWT_SECRET);
-        const { password, ...userWithoutPassword } = user;
-        res.json({ token, user: userWithoutPassword });
-    } else {
-        res.status(401).json({ error: "Identifiants incorrects" });
-    }
+        res.json({ token, user });
+    } else if (user && user.isBanned) {
+        res.status(403).json({ error: "Votre compte est banni" });
+    } else res.status(401).json({ error: "Identifiants invalides" });
 });
 
-// --- TEMPS RÉEL (SOCKET.IO) ---
+// --- TEMPS RÉEL ---
 io.use((socket, next) => {
     const token = socket.handshake.auth.token;
-    if (token) {
-        jwt.verify(token, JWT_SECRET, (err, decoded) => {
-            if (err) return next(new Error("Erreur Auth"));
-            socket.userId = decoded.userId;
-            next();
-        });
-    } else next(new Error("Erreur Auth"));
+    if (!token) return next(new Error("Auth error"));
+    jwt.verify(token, JWT_SECRET, (err, decoded) => {
+        if (err) return next(new Error("Auth error"));
+        socket.userId = decoded.userId;
+        next();
+    });
 });
 
 io.on('connection', (socket) => {
-    console.log(`🔌 Connecté : ${socket.userId}`);
+    const user = users.find(u => u.id === socket.userId);
+    if (!user) return;
+
     socket.join(socket.userId);
+    if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN') {
+        socket.join('admins');
+    }
+
+    console.log(`✅ ${user.username} est en ligne`);
+
+    socket.emit('current_user', user);
     socket.emit('products_list', products);
+    socket.emit('messages_history', messages.filter(m => m.receiverId === user.id || m.senderId === user.id || m.receiverId === 'global'));
+
+    if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN') {
+        socket.emit('admin_data', { users, logs, transactions });
+    }
 
     socket.on('buy_product', (data) => {
         const product = products.find(p => p.id === data.productId);
-        const user = users.find(u => u.id === socket.userId);
-
-        if (product && user && product.stock > 0 && user.balance >= product.price) {
-            product.stock -= 1;
+        if (product && product.stock > 0 && user.balance >= product.price) {
+            product.stock--;
             user.balance -= product.price;
-            io.to(socket.userId).emit('update_balance', { balance: user.balance });
+            user.xp += 50;
+            if (user.xp >= user.level * 200) { user.level++; user.xp = 0; }
+
+            const tx = { id: uuidv4(), senderId: user.id, receiverId: product.sellerId, amount: product.price, details: `Achat: ${product.name}`, timestamp: Date.now() };
+            transactions.unshift(tx);
+
+            io.to(socket.userId).emit('current_user', user);
             io.emit('product_sold', product);
-            console.log(`🛒 Achat : ${user.username} a acheté ${product.name}`);
+            io.to('admins').emit('new_transaction', tx);
+            io.to(socket.userId).emit('notification', { message: `Achat réussi: ${product.name} !` });
+            addLog("Purchase", `${user.username} a acheté ${product.name}`);
         }
     });
 
-    socket.on('disconnect', () => console.log("❌ Déconnecté"));
+    socket.on('send_message', (data) => {
+        const msg = { id: uuidv4(), senderId: user.id, senderName: user.username, content: data.content, receiverId: data.receiverId || 'global', timestamp: Date.now() };
+        messages.push(msg);
+        if (msg.receiverId === 'global') io.emit('new_message', msg);
+        else {
+            io.to(msg.receiverId).emit('new_message', msg);
+            io.to(user.id).emit('new_message', msg);
+        }
+    });
+
+    // --- ACTIONS ADMIN ---
+    socket.on('admin_announcement', (data) => {
+        if (user.role !== 'USER') {
+            io.emit('global_announcement', { text: data.text });
+            addLog("Announcement", `${user.username}: ${data.text}`);
+        }
+    });
+
+    socket.on('admin_modify_balance', (data) => {
+        if (user.role === 'SUPER_ADMIN') {
+            const target = users.find(u => u.id === data.userId);
+            if (target) {
+                target.balance = data.amount;
+                io.to(target.id).emit('current_user', target);
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("BalanceMod", `${user.username} a mis le solde de ${target.username} à ${data.amount}`);
+            }
+        }
+    });
+
+    socket.on('admin_ban_user', (data) => {
+        if (user.role !== 'USER') {
+            const target = users.find(u => u.id === data.userId);
+            if (target && target.role === 'USER') {
+                target.isBanned = true;
+                io.to(target.id).emit('banned');
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("Ban", `${user.username} a banni ${target.username}`);
+            }
+        }
+    });
+
+    socket.on('admin_add_product', (data) => {
+        if (user.role !== 'USER') {
+            const newProduct = { id: uuidv4(), ...data, createdAt: Date.now() };
+            products.push(newProduct);
+            io.emit('new_product', newProduct);
+            addLog("AddProduct", `${user.username} a ajouté ${data.name}`);
+        }
+    });
+
+    socket.on('admin_delete_product', (data) => {
+        if (user.role !== 'USER') {
+            products = products.filter(p => p.id !== data.productId);
+            io.emit('products_list', products);
+            addLog("DeleteProduct", `${user.username} a supprimé le produit ${data.productId}`);
+        }
+    });
+
+    socket.on('disconnect', () => console.log(`❌ ${user.username} déconnecté`));
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 SERVEUR ÉCONOMIE PRÊT SUR LE PORT ${PORT}`);
-});
+server.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log("🚀 SERVEUR COMPLET EN LIGNE"));
