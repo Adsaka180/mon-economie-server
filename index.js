@@ -19,33 +19,41 @@ const io = new Server(server, {
 
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_key";
 
-// --- BASE DE DONNÉES EN MÉMOIRE ---
+// --- CONFIGURATION PERSONNALISABLE PAR SUPER ADMIN ---
+let globalSettings = {
+    appName: "Économie Virtuelle",
+    currencySymbol: "$",
+    defaultBalance: 1000,
+    xpMultiplier: 1.0,
+    registrationEnabled: true,
+    maintenanceMode: false,
+    themePrimaryColor: "#6200EE"
+};
+
 let users = [];
 let products = [
     { id: "p1", name: "Pack Fondateur", description: "Un pack exclusif pour les premiers arrivés.", price: 0, stock: 100, category: "Événement", imageUrl: "https://cdn-icons-png.flaticon.com/512/1063/1063376.png", sellerId: "system", salesCount: 0 },
-    { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: 10, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png", sellerId: "system", salesCount: 0 },
-    { id: "p3", name: "Lingot d'Or", description: "Valeur refuge.", price: 5000, stock: 50, category: "Ressources", imageUrl: "https://cdn-icons-png.flaticon.com/512/2481/2481134.png", sellerId: "system", salesCount: 0 }
+    { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: 10, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png", sellerId: "system", salesCount: 0 }
 ];
 let messages = [];
 let logs = [];
 let transactions = [];
 let titles = [
-    { id: "t1", name: "Fondateur", rarity: "EXCLUSIF_ADMIN", color: "#FFD700", animation: "glow" },
-    { id: "t2", name: "Nouveau", rarity: "COMMUN", color: "#FFFFFF", animation: "none" }
+    { id: "t1", name: "Fondateur", rarity: "EXCLUSIF_ADMIN", color: "#FFD700", animation: "glow", icon: "👑" },
+    { id: "t2", name: "Nouveau", rarity: "COMMUN", color: "#FFFFFF", animation: "none", icon: "🌱" }
 ];
 
-// --- INITIALISATION ADMIN ---
+// --- INITIALISATION SUPER ADMIN ---
 async function initAdmin() {
     const hashedPassword = await bcrypt.hash("admin123", 10);
     const admin = {
         id: "admin-id", username: "admin", password: hashedPassword,
         balance: 1000000, role: "SUPER_ADMIN", level: 100, xp: 0, reputation: 100,
-        title: "Fondateur", isBanned: false, status: "online", bio: "Le créateur du système.",
+        title: "Fondateur", isBanned: false, status: "offline", bio: "Le créateur du système.",
         bannerUrl: "https://images.unsplash.com/photo-1557683316-973673baf926",
-        profileImageUrl: "https://ui-avatars.com/api/?name=Admin&background=FFD700&color=fff",
-        favorites: [], salesHistory: [], purchaseHistory: []
+        profileImageUrl: "https://ui-avatars.com/api/?name=Admin&background=FFD700&color=fff"
     };
-    users.push(admin);
+    if (!users.find(u => u.username === "admin")) users.push(admin);
 }
 initAdmin();
 
@@ -56,16 +64,15 @@ function addLog(action, details) {
     io.to('admins').emit('new_log', log);
 }
 
-// --- API AUTH ---
+// --- API ROUTES ---
 app.post('/register', async (req, res) => {
+    if (!globalSettings.registrationEnabled) return res.status(403).json({ error: "Inscriptions désactivées" });
     const { username, password } = req.body;
     if (users.find(u => u.username === username)) return res.status(400).json({ error: "Pseudo déjà pris" });
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = {
-        id: uuidv4(), username, password: hashedPassword, balance: 1000, role: 'USER',
-        level: 1, xp: 0, reputation: 0, title: "Nouveau", isBanned: false, status: "offline",
-        bio: "", bannerUrl: null, profileImageUrl: null, favorites: [],
-        salesHistory: [], purchaseHistory: []
+        id: uuidv4(), username, password: hashedPassword, balance: globalSettings.defaultBalance, role: 'USER',
+        level: 1, xp: 0, reputation: 0, title: "Nouveau", isBanned: false, status: "offline"
     };
     users.push(user);
     addLog("Register", `Nouvel utilisateur: ${username}`);
@@ -98,18 +105,14 @@ io.on('connection', (socket) => {
     const user = users.find(u => u.id === socket.userId);
     if (!user) return;
 
-    user.status = "online";
-    socket.join(user.id);
+    socket.join(socket.userId);
     if (user.role !== 'USER') socket.join('admins');
 
-    console.log(`✅ ${user.username} connecté`);
-    io.emit('user_status_change', { userId: user.id, status: "online" });
-
-    // Envoi initial complet pour la synchro directe
     socket.emit('initial_data', {
         currentUser: user,
         products,
         titles,
+        settings: globalSettings,
         leaderboard: users.sort((a, b) => b.balance - a.balance).slice(0, 50).map(u => ({ id: u.id, username: u.username, balance: u.balance, level: u.level })),
         messages: messages.filter(m => m.receiverId === user.id || m.senderId === user.id || m.receiverId === 'global')
     });
@@ -118,80 +121,53 @@ io.on('connection', (socket) => {
         socket.emit('admin_data', { users, logs, transactions });
     }
 
-    // --- MARKETPLACE ACTIONS ---
+    // --- MARKETPLACE ---
     socket.on('buy_product', (data) => {
         const product = products.find(p => p.id === data.productId);
         if (product && product.stock > 0 && user.balance >= product.price) {
-            // Transaction atomique
             product.stock--;
-            product.salesCount++;
             user.balance -= product.price;
-            user.xp += 50;
-            user.purchaseHistory.push({ productId: product.id, name: product.name, price: product.price, date: Date.now() });
-
-            // Créditer le vendeur
-            const seller = users.find(u => u.id === product.sellerId);
-            if (seller) {
-                seller.balance += product.price;
-                seller.xp += 30;
-                seller.salesHistory.push({ productId: product.id, name: product.name, price: product.price, buyerName: user.username, date: Date.now() });
-                io.to(seller.id).emit('current_user', seller);
-                io.to(seller.id).emit('notification', { message: `Vente réussie: ${product.name} (+${product.price} $)` });
-            }
-
-            // Level up check
-            if (user.xp >= user.level * 250) {
-                user.level++;
-                user.xp = 0;
-                io.to(user.id).emit('notification', { message: `Félicitations ! Vous êtes passé au niveau ${user.level} ! 🎉` });
-            }
-
-            const tx = { id: uuidv4(), senderId: user.id, receiverId: product.sellerId, amount: product.price, details: `Achat: ${product.name}`, timestamp: Date.now(), type: 'PURCHASE' };
-            transactions.unshift(tx);
+            user.xp += (50 * globalSettings.xpMultiplier);
+            if (user.xp >= user.level * 250) { user.level++; user.xp = 0; }
 
             io.to(user.id).emit('current_user', user);
             io.emit('product_updated', product);
-            io.to('admins').emit('new_transaction', tx);
-            io.to(user.id).emit('notification', { message: `Achat de ${product.name} confirmé !` });
             addLog("Marketplace", `${user.username} a acheté ${product.name}`);
         }
     });
 
-    // --- COMMUNICATION ---
-    socket.on('send_message', (data) => {
-        const msg = { id: uuidv4(), senderId: user.id, senderName: user.username, content: data.content, receiverId: data.receiverId || 'global', timestamp: Date.now() };
-        messages.push(msg);
-        if (messages.length > 1000) messages.shift();
-
-        if (msg.receiverId === 'global') io.emit('new_message', msg);
-        else {
-            io.to(msg.receiverId).emit('new_message', msg);
-            io.to(user.id).emit('new_message', msg);
-        }
-    });
-
-    socket.on('typing', (data) => {
-        socket.to(data.receiverId === 'global' ? 'global' : data.receiverId).emit('user_typing', { userId: user.id, username: user.username });
-    });
-
-    // --- ACTIONS SUPER ADMIN ---
-    socket.on('admin_create_title', (data) => {
+    // --- ACTIONS SUPER ADMIN (CUSTOMIZATION) ---
+    socket.on('super_admin_update_settings', (newSettings) => {
         if (user.role === 'SUPER_ADMIN') {
-            const newTitle = { id: uuidv4(), ...data };
-            titles.push(newTitle);
-            io.emit('title_created', newTitle);
-            addLog("Admin", `Nouveau titre créé: ${data.name}`);
+            globalSettings = { ...globalSettings, ...newSettings };
+            io.emit('settings_updated', globalSettings);
+            addLog("Settings", "Configuration globale mise à jour");
         }
     });
 
-    socket.on('admin_assign_title', (data) => {
+    socket.on('super_admin_modify_user', (data) => {
         if (user.role === 'SUPER_ADMIN') {
             const target = users.find(u => u.id === data.userId);
             if (target) {
-                target.title = data.titleName;
+                Object.assign(target, data.updates);
                 io.to(target.id).emit('current_user', target);
-                addLog("Admin", `Titre ${data.titleName} attribué à ${target.username}`);
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("Admin", `Utilisateur ${target.username} modifié`);
             }
+        }
+    });
+
+    socket.on('super_admin_manage_title', (data) => {
+        if (user.role === 'SUPER_ADMIN') {
+            if (data.action === 'create') {
+                const newTitle = { id: uuidv4(), ...data.title };
+                titles.push(newTitle);
+                io.emit('titles_list', titles);
+            } else if (data.action === 'delete') {
+                titles = titles.filter(t => t.id !== data.titleId);
+                io.emit('titles_list', titles);
+            }
+            addLog("Admin", `Gestion des titres: ${data.action}`);
         }
     });
 
@@ -202,20 +178,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('claim_daily', () => {
-        const reward = 100 + (user.level * 10);
-        user.balance += reward;
-        user.xp += 20;
-        io.to(user.id).emit('current_user', user);
-        io.to(user.id).emit('notification', { message: `Cadeau quotidien récupéré: +${reward} $` });
-    });
-
-    socket.on('disconnect', () => {
-        user.status = "offline";
-        io.emit('user_status_change', { userId: user.id, status: "offline" });
-        console.log(`❌ ${user.username} déconnecté`);
-    });
+    socket.on('disconnect', () => {});
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`🚀 SERVEUR ULTIME ÉCONOMIE ACTIF SUR ${PORT}`));
+server.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log("🚀 SUPER ADMIN ENGINE READY"));
