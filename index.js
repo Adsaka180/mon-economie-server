@@ -17,64 +17,79 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Connexion à la base de données Cloud (MongoDB Atlas)
-// Si aucune URL n'est fournie, on utilise une base locale pour ne pas bloquer le démarrage
 const mongoURI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/economie";
+const JWT_SECRET = process.env.JWT_SECRET || "secret_par_defaut_123";
+
 mongoose.connect(mongoURI)
-    .then(() => console.log("✅ Base de données Cloud connectée"))
+    .then(() => {
+        console.log("✅ Base de données connectée");
+        seedAdmin(); // Créer le super admin au démarrage
+    })
     .catch(err => console.error("❌ Erreur DB:", err));
 
-// Modèles de données
+// Modèles
 const UserSchema = new mongoose.Schema({
     username: { type: String, unique: true, required: true },
     password: { type: String, required: true },
-    balance: { type: Number, default: 100.0 },
-    role: { type: String, default: 'USER' },
+    balance: { type: Number, default: 1000.0 },
+    role: { type: String, default: 'USER' }, // USER, ADMIN, SUPER_ADMIN
     level: { type: Number, default: 1 },
     reputation: { type: Number, default: 0 },
     xp: { type: Number, default: 0 },
-    title: String
+    title: { type: String, default: "Nouveau" }
 });
 const User = mongoose.model('User', UserSchema);
 
-const ProductSchema = new mongoose.Schema({
-    name: String,
-    description: String,
-    price: Number,
-    stock: Number,
-    category: String,
-    sellerId: String,
-    imageUrl: String,
-    createdAt: { type: Number, default: Date.now }
-});
-const Product = mongoose.model('Product', ProductSchema);
+// Fonction pour créer le Super Admin par défaut
+async function seedAdmin() {
+    const adminExists = await User.findOne({ username: "admin" });
+    if (!adminExists) {
+        const hashedPassword = await bcrypt.hash("admin123", 10);
+        const admin = new User({
+            username: "admin",
+            password: hashedPassword,
+            role: "SUPER_ADMIN",
+            balance: 1000000.0,
+            title: "Créateur"
+        });
+        await admin.save();
+        console.log("👑 Super Admin créé: admin / admin123");
+    }
+}
 
-// --- AUTHENTIFICATION ---
+// --- ROUTES AUTH ---
 app.post('/register', async (req, res) => {
     try {
         const { username, password } = req.body;
+        if (!username || !password) return res.status(400).json({ error: "Champs manquants" });
+
         const hashedPassword = await bcrypt.hash(password, 10);
         const newUser = new User({ username, password: hashedPassword });
         await newUser.save();
-        const token = jwt.sign({ userId: newUser._id }, process.env.JWT_SECRET || "secret_temp");
+
+        const token = jwt.sign({ userId: newUser._id }, JWT_SECRET);
         res.json({ token, user: newUser });
-    } catch (e) { res.status(400).json({ error: "Utilisateur déjà existant" }); }
+    } catch (e) {
+        res.status(400).json({ error: "Nom d'utilisateur déjà pris" });
+    }
 });
 
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
     const user = await User.findOne({ username });
     if (user && await bcrypt.compare(password, user.password)) {
-        const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || "secret_temp");
+        const token = jwt.sign({ userId: user._id }, JWT_SECRET);
         res.json({ token, user });
-    } else { res.status(401).json({ error: "Identifiants invalides" }); }
+    } else {
+        res.status(401).json({ error: "Identifiants incorrects" });
+    }
 });
 
-// --- TEMPS RÉEL (SOCKET.IO) ---
+// --- SOCKET.IO ---
 io.use((socket, next) => {
     const token = socket.handshake.auth.token;
     if (token) {
-        jwt.verify(token, process.env.JWT_SECRET || "secret_temp", (err, decoded) => {
+        jwt.verify(token, JWT_SECRET, (err, decoded) => {
             if (err) return next(new Error("Auth Error"));
             socket.userId = decoded.userId;
             next();
@@ -84,34 +99,12 @@ io.use((socket, next) => {
 
 io.on('connection', async (socket) => {
     socket.join(socket.userId);
+    console.log(`Connecté: ${socket.userId}`);
 
-    // Envoyer les produits au démarrage
-    const products = await Product.find();
-    socket.emit('products_list', products);
-
-    socket.on('buy_product', async (data) => {
-        const product = await Product.findById(data.productId);
-        const user = await User.findById(socket.userId);
-
-        if (product && user && product.stock > 0 && user.balance >= product.price) {
-            product.stock -= 1;
-            user.balance -= product.price;
-            await product.save();
-            await user.save();
-
-            io.to(socket.userId).emit('update_balance', { balance: user.balance });
-            io.emit('product_sold', product);
-        }
-    });
-
-    socket.on('send_message', (data) => {
-        const msg = { id: uuidv4(), senderId: socket.userId, ...data, timestamp: Date.now() };
-        io.to(data.receiverId).emit('new_message', msg);
-        io.to(socket.userId).emit('new_message', msg);
-    });
+    socket.on('disconnect', () => console.log("Déconnecté"));
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Serveur Économie en ligne sur le port ${PORT}`);
+    console.log(`🚀 Serveur en ligne sur le port ${PORT}`);
 });
