@@ -36,7 +36,8 @@ const UserSchema = new mongoose.Schema({
     lastChest: { type: Number, default: 0 },
     totalAccountValue: { type: Number, default: 1000 },
     isBanned: { type: Boolean, default: false },
-    lastSeen: { type: Number, default: Date.now }
+    lastSeen: { type: Number, default: Date.now },
+    status: { type: String, default: "offline" }
 });
 
 UserSchema.set('toJSON', {
