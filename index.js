@@ -14,7 +14,47 @@ app.use(express.json());
 
 // --- DATABASE SETUP ---
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://adsaka180_db_user:Elbereth2%23@cluster0.0glfahz.mongodb.net/economie?retryWrites=true&w=majority";
-mongoose.connect(MONGO_URI).then(() => console.log("🍃 MongoDB Connected")).catch(err => console.error("❌ DB Error:", err));
+
+async function resetDatabase() {
+    try {
+        await User.deleteMany({});
+        await Product.deleteMany({});
+        await Auction.deleteMany({});
+        await Log.deleteMany({});
+        await Message.deleteMany({});
+        await Report.deleteMany({});
+
+        const hashedPassword = await bcrypt.hash("admin123", 10);
+        const admin = new User({
+            username: "admin",
+            password: hashedPassword,
+            balance: 1000000,
+            role: "SUPER_ADMIN",
+            level: 100,
+            reputation: 100,
+            title: "Fondateur",
+            statusMessage: "👑 Créateur de l'économie",
+            badges: ["🛡️ Staff", "💎 Fondateur"],
+            totalAccountValue: 1000000
+        });
+        await admin.save();
+
+        const welcomeProducts = [
+            { name: "Pack Fondateur", description: "Édition limitée pour le reset", price: 0, stock: -1, category: "Événement", sellerId: admin._id, sellerName: "Admin" },
+            { name: "Lingot d'Or", description: "Valeur refuge", price: 5000, stock: 100, category: "Ressources", sellerId: admin._id, sellerName: "Admin" }
+        ];
+        await Product.insertMany(welcomeProducts);
+
+        console.log("✅ BASE DE DONNÉES RÉINITIALISÉE : Seul l'admin existe.");
+    } catch(e) {
+        console.error("❌ Erreur reset :", e);
+    }
+}
+
+mongoose.connect(MONGO_URI).then(() => {
+    console.log("🍃 MongoDB Connected");
+    resetDatabase(); // Supprime tout et crée l'admin au démarrage
+}).catch(err => console.error("❌ DB Error:", err));
 
 const UserSchema = new mongoose.Schema({
     username: { type: String, unique: true, required: true },
@@ -445,7 +485,75 @@ io.on('connection', async (socket) => {
         } else if (!hasStock) {
             socket.emit('notification', { message: "Article épuisé !" });
         } else {
-            socket.emit('notification', { message: `Il vous manque ${(currentPrice - user.balance).toInt()} $ !` });
+            socket.emit('notification', { message: `Il vous manque ${Math.floor(currentPrice - user.balance)} $ !` });
+        }
+    });
+
+    socket.on('admin_add_product', async (data) => {
+        const newProduct = new Product({
+            name: data.name,
+            description: data.description,
+            price: parseFloat(data.price),
+            stock: parseInt(data.stock),
+            category: data.category,
+            imageUrl: data.imageUrl || "https://cdn-icons-png.flaticon.com/512/1170/1170577.png",
+            sellerId: user._id,
+            sellerName: user.username,
+            isLimited: data.stock !== -1
+        });
+        await newProduct.save();
+        const allProducts = await Product.find();
+        io.emit('products_list', allProducts);
+        addLog("Admin", `${user.username} a mis en vente : ${newProduct.name}`, io);
+    });
+
+    socket.on('admin_delete_product', async (data) => {
+        if (user.role !== 'USER') {
+            await Product.findByIdAndDelete(data.productId);
+            const allProducts = await Product.find();
+            io.emit('products_list', allProducts);
+            addLog("Admin", `${user.username} a supprimé un produit`, io);
+        }
+    });
+
+    socket.on('admin_modify_balance', async (data) => {
+        if (user.role !== 'USER') {
+            const target = await User.findById(data.userId);
+            if (target) {
+                target.balance += parseFloat(data.amount);
+                await target.save();
+                io.to(target._id.toString()).emit('current_user', target);
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("Admin", `${user.username} a ajusté le solde de ${target.username} de ${data.amount}`, io);
+            }
+        }
+    });
+
+    socket.on('admin_global_announcement', (data) => {
+        if (user.role !== 'USER') {
+            io.emit('global_announcement', { text: data.text });
+            addLog("Admin", `Annonce globale: ${data.text}`, io);
+        }
+    });
+
+    socket.on('admin_ban_user', async (data) => {
+        if (user.role !== 'USER') {
+            const target = await User.findById(data.userId);
+            if (target && target.role === 'USER') {
+                target.isBanned = true;
+                await target.save();
+                io.to(target._id.toString()).emit('banned');
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("Admin", `${user.username} a banni ${target.username}`, io);
+            }
+        }
+    });
+
+    socket.on('super_admin_update_settings', (data) => {
+        if (user.role === 'SUPER_ADMIN') {
+            Object.assign(globalSettings, data);
+            io.emit('settings_updated', globalSettings);
+            addLog("Admin", "Paramètres globaux mis à jour", io);
         }
     });
 
