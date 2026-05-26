@@ -11,6 +11,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- SELF-PING TO KEEP ALIVE ON RENDER ---
+const RENDER_EXTERNAL_URL = "https://mon-economie-server.onrender.com";
+
+app.get('/ping', (req, res) => {
+    res.status(200).send('pong');
+});
+
+function keepAlive() {
+    setInterval(() => {
+        http.get(RENDER_EXTERNAL_URL + "/ping", (res) => {
+            console.log(`Self-ping status: ${res.statusCode}`);
+        }).on('error', (err) => {
+            console.error(`Self-ping error: ${err.message}`);
+        });
+    }, 10 * 60 * 1000); // Ping toutes les 10 minutes
+}
+
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
@@ -187,4 +204,7 @@ io.on('connection', (socket) => {
     });
 });
 
-server.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log("🚀 ECO-SYSTEM FULL LOADED"));
+server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
+    console.log("🚀 ECO-SYSTEM FULL LOADED");
+    keepAlive(); // Démarrer le système d'auto-réveil
+});
