@@ -92,6 +92,15 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
+TransactionSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        delete ret._id;
+        delete ret.__v;
+        return ret;
+    }
+});
+
 const AuctionSchema = new mongoose.Schema({
     productId: String,
     productName: String,
@@ -216,10 +225,14 @@ async function addTransaction(data) {
 
 async function calculateTotalValue(user) {
     let inventoryValue = 0;
-    const prods = await Product.find({ _id: { $in: user.inventory } });
-    const multiplier = getMarketMultiplier();
-    prods.forEach(p => inventoryValue += (p.price * multiplier));
-    return user.balance + inventoryValue;
+    try {
+        const prods = await Product.find({ _id: { $in: user.inventory } });
+        const multiplier = getMarketMultiplier();
+        prods.forEach(p => {
+            inventoryValue += (p.price * multiplier);
+        });
+    } catch(e) { console.error("Calc error:", e); }
+    return Math.floor(user.balance + inventoryValue);
 }
 
 function getMarketMultiplier() {
@@ -279,16 +292,53 @@ function keepAlive() {
     }, 10 * 60 * 1000);
 }
 
-// --- MARKET TRENDS ---
+// --- MARKET TRENDS & AUCTION CLEANUP ---
 setInterval(async () => {
-    const trends = ["Stable", "Hausse", "Baisse", "Inflation", "Krak Boursier"];
+    const trends = ["Stable", "Hausse", "Baisse", "Inflation", "Krak Boursier", "Apocalypse"];
     globalSettings.marketTrend = trends[Math.floor(Math.random() * trends.length)];
-    const io = app.get('io');
-    if (io) {
-        io.emit('settings_updated', globalSettings);
-        io.emit('notification', { message: `La météo économique a changé : ${globalSettings.marketTrend} !` });
+
+    let settings = await GlobalSettings.findOne();
+    if (settings) {
+        settings.marketTrend = globalSettings.marketTrend;
+        await settings.save();
     }
+
+    io.emit('settings_updated', globalSettings);
+    io.emit('notification', { message: `La météo économique a changé : ${globalSettings.marketTrend} !` });
 }, 30 * 60 * 1000);
+
+// Background task to finish auctions
+setInterval(async () => {
+    const now = Date.now();
+    const finishedAuctions = await Auction.find({ endTime: { $lte: now }, isFinished: false });
+
+    for (const auction of finishedAuctions) {
+        auction.isFinished = true;
+        await auction.save();
+
+        if (auction.highestBidderId) {
+            const winner = await User.findById(auction.highestBidderId);
+            const seller = await User.findById(auction.sellerId);
+
+            if (winner && seller) {
+                // Item is already in seller's inventory or removed from market?
+                // Let's assume the auction transfers an item from seller inventory to winner
+                seller.inventory = seller.inventory.filter(id => id !== auction.productId);
+                winner.inventory.push(auction.productId);
+                seller.balance += auction.highestBid;
+
+                await seller.save();
+                await winner.save();
+
+                io.to(winner._id.toString()).emit('current_user', winner);
+                io.to(seller._id.toString()).emit('current_user', seller);
+                io.to(winner._id.toString()).emit('notification', { message: `🏆 Vous avez gagné l'enchère pour ${auction.productName} !` });
+                io.to(seller._id.toString()).emit('notification', { message: `💰 Votre objet ${auction.productName} a été vendu aux enchères !` });
+            }
+        }
+        io.emit('auction_update', auction);
+    }
+}, 30000); // Check every 30 seconds
 
 // --- API ---
 app.post('/register', async (req, res) => {
@@ -547,6 +597,18 @@ io.on('connection', async (socket) => {
         }
     });
 
+    socket.on('admin_mute_user', async (data) => {
+        if (user.role !== 'USER') {
+            const target = await User.findById(data.userId);
+            if (target) {
+                target.isMuted = !target.isMuted;
+                await target.save();
+                io.to(target._id.toString()).emit('current_user', target);
+                addLog("Admin", `${user.username} a ${target.isMuted ? 'réduit au silence' : 'débloqué la parole de'} ${target.username}`, io);
+            }
+        }
+    });
+
     socket.on('admin_force_logout', (data) => {
         if (user.role !== 'USER') {
             io.to(data.userId).emit('banned');
@@ -554,10 +616,57 @@ io.on('connection', async (socket) => {
         }
     });
 
+    socket.on('admin_unban_user', async (data) => {
+        if (user.role !== 'USER') {
+            const target = await User.findById(data.userId);
+            if (target) {
+                target.isBanned = false;
+                await target.save();
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("Admin", `${user.username} a débanni ${target.username}`, io);
+            }
+        }
+    });
+
+    socket.on('admin_shadow_ban', async (data) => {
+        if (user.role !== 'USER') {
+            const target = await User.findById(data.userId);
+            if (target) {
+                target.isShadowBanned = !target.isShadowBanned;
+                await target.save();
+                io.to(target._id.toString()).emit('current_user', target);
+                addLog("Admin", `${user.username} a ${target.isShadowBanned ? 'shadow ban' : 'un-shadow ban'} ${target.username}`, io);
+            }
+        }
+    });
+
+    socket.on('admin_global_reward', async (data) => {
+        if (user.role === 'SUPER_ADMIN') {
+            const reward = parseFloat(data.amount);
+            await User.updateMany({ role: 'USER' }, { $inc: { balance: reward } });
+            io.emit('notification', { message: `💸 PLUIE DE RÉCOMPENSES : +${reward} $ pour tout le monde !` });
+            addLog("Admin", `Récompense globale de ${reward} $ distribuée`, io);
+        }
+    });
+
     socket.on('admin_global_announcement', (data) => {
         if (user.role !== 'USER') {
             io.emit('global_announcement', { text: data.text });
             addLog("Admin", `Annonce globale: ${data.text}`, io);
+        }
+    });
+
+    socket.on('admin_spawn_item', async (data) => {
+        if (user.role === 'SUPER_ADMIN') {
+            const target = await User.findById(data.userId);
+            const product = await Product.findById(data.productId);
+            if (target && product) {
+                target.inventory.push(product._id.toString());
+                await target.save();
+                io.to(target._id.toString()).emit('current_user', target);
+                io.to(target._id.toString()).emit('notification', { message: `🎁 Un admin vous a donné : ${product.name}` });
+                addLog("Admin", `Item ${product.name} spawn pour ${target.username}`, io);
+            }
         }
     });
 
