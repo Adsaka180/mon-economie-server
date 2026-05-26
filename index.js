@@ -706,13 +706,19 @@ io.on('connection', async (socket) => {
     });
 
     socket.on('start_auction', async (data) => {
-        const product = await Product.findOne({ _id: data.productId, sellerId: user._id });
+        let product;
+        if (user.role !== 'USER') {
+            product = await Product.findById(data.productId);
+        } else {
+            product = await Product.findOne({ _id: data.productId, sellerId: user._id });
+        }
+
         if (product) {
             const auction = new Auction({
                 productId: product._id,
                 productName: product.name,
-                sellerId: user._id,
-                sellerName: user.username,
+                sellerId: product.sellerId,
+                sellerName: product.sellerName,
                 highestBid: product.price * getMarketMultiplier(),
                 endTime: Date.now() + (data.durationMinutes * 60000)
             });
