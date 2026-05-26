@@ -184,24 +184,22 @@ io.on('connection', (socket) => {
     });
 
     socket.on('admin_add_product', (data) => {
-        if (user.role !== 'USER') {
-            const newProduct = {
-                id: uuidv4(),
-                name: data.name,
-                description: data.description,
-                price: parseFloat(data.price),
-                stock: parseInt(data.stock), // -1 pour infini
-                category: data.category,
-                imageUrl: data.imageUrl || "https://cdn-icons-png.flaticon.com/512/1170/1170577.png",
-                sellerId: user.id,
-                sellerName: user.username,
-                salesCount: 0,
-                createdAt: Date.now()
-            };
-            products.push(newProduct);
-            io.emit('products_list', products);
-            addLog("Admin", `${user.username} a créé le produit ${newProduct.name}`);
-        }
+        const newProduct = {
+            id: uuidv4(),
+            name: data.name,
+            description: data.description,
+            price: parseFloat(data.price),
+            stock: parseInt(data.stock), // -1 pour infini
+            category: data.category,
+            imageUrl: data.imageUrl || "https://cdn-icons-png.flaticon.com/512/1170/1170577.png",
+            sellerId: user.id,
+            sellerName: user.username,
+            salesCount: 0,
+            createdAt: Date.now()
+        };
+        products.push(newProduct);
+        io.emit('products_list', products);
+        addLog("Market", `${user.username} a mis en vente : ${newProduct.name}`);
     });
 
     socket.on('admin_delete_product', (data) => {
