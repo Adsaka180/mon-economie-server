@@ -5,11 +5,157 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// --- DATABASE SETUP ---
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://admin:admin@cluster.mongodb.net/economie?retryWrites=true&w=majority";
+mongoose.connect(MONGO_URI).then(() => console.log("🍃 MongoDB Connected")).catch(err => console.error("❌ DB Error:", err));
+
+const UserSchema = new mongoose.Schema({
+    username: { type: String, unique: true, required: true },
+    password: { type: String, required: true },
+    balance: { type: Number, default: 1000 },
+    role: { type: String, default: 'USER' },
+    level: { type: Number, default: 1 },
+    xp: { type: Number, default: 0 },
+    reputation: { type: Number, default: 0 },
+    title: String,
+    statusMessage: String,
+    badges: [String],
+    inventory: [String],
+    unlockedAchievements: [String],
+    friends: [{ userId: String, status: String }],
+    streak: { type: Number, default: 0 },
+    lastDaily: { type: Number, default: 0 },
+    lastWheel: { type: Number, default: 0 },
+    lastChest: { type: Number, default: 0 },
+    totalAccountValue: { type: Number, default: 1000 },
+    isBanned: { type: Boolean, default: false },
+    lastSeen: { type: Number, default: Date.now }
+});
+const User = mongoose.model('User', UserSchema);
+
+const ProductSchema = new mongoose.Schema({
+    name: String,
+    description: String,
+    price: Number,
+    stock: Number,
+    category: String,
+    imageUrl: String,
+    sellerId: String,
+    sellerName: String,
+    isLimited: Boolean,
+    createdAt: { type: Number, default: Date.now }
+});
+const Product = mongoose.model('Product', ProductSchema);
+
+const AuctionSchema = new mongoose.Schema({
+    productId: String,
+    productName: String,
+    sellerId: String,
+    sellerName: String,
+    highestBid: Number,
+    highestBidderId: String,
+    highestBidderName: String,
+    endTime: Number,
+    isFinished: { type: Boolean, default: false }
+});
+const Auction = mongoose.model('Auction', AuctionSchema);
+
+const LogSchema = new mongoose.Schema({
+    action: String,
+    details: String,
+    timestamp: { type: Number, default: Date.now }
+});
+const Log = mongoose.model('Log', LogSchema);
+
+const MessageSchema = new mongoose.Schema({
+    senderId: String,
+    senderName: String,
+    receiverId: { type: String, default: 'global' },
+    content: String,
+    timestamp: { type: Number, default: Date.now }
+});
+const Message = mongoose.model('Message', MessageSchema);
+
+const ReportSchema = new mongoose.Schema({
+    reporter: String,
+    targetId: String,
+    reason: String,
+    timestamp: { type: Number, default: Date.now }
+});
+const Report = mongoose.model('Report', ReportSchema);
+
+// --- GLOBAL STATE ---
+let globalSettings = {
+    appName: "Économie Virtuelle",
+    currencySymbol: "$",
+    defaultBalance: 1000,
+    xpMultiplier: 1.0,
+    registrationEnabled: true,
+    maintenanceMode: false,
+    economyEvent: "Normal",
+    marketTrend: "Stable"
+};
+
+const achievements = [
+    { id: "a1", name: "Premier Pas", description: "Faire son premier achat", icon: "🌱", xpReward: 100 },
+    { id: "a2", name: "Capitaliste", description: "Atteindre 10 000 $ de solde", icon: "💰", xpReward: 500 },
+    { id: "a3", name: "Vendeur Né", description: "Mettre son premier objet en vente", icon: "📦", xpReward: 200 }
+];
+
+const titles = [
+    { id: "t1", name: "Fondateur", rarity: "EXCLUSIF_ADMIN", color: "#FFD700", animation: "glow", icon: "👑" },
+    { id: "t2", name: "Nouveau", rarity: "COMMUN", color: "#FFFFFF", animation: "none", icon: "🌱" }
+];
+
+const codes = [
+    { code: "START", reward: 500, uses: 100 }
+];
+
+// --- HELPERS ---
+async function calculateTotalValue(user) {
+    let inventoryValue = 0;
+    for (const prodId of user.inventory) {
+        const p = await Product.findById(prodId);
+        if (p) inventoryValue += p.price;
+    }
+    return user.balance + inventoryValue;
+}
+
+async function checkAchievements(user, io) {
+    let updated = false;
+    for (const ach of achievements) {
+        if (!user.unlockedAchievements.includes(ach.id)) {
+            let unlocked = false;
+            if (ach.id === "a1" && user.inventory.length > 0) unlocked = true;
+            if (ach.id === "a2" && user.balance >= 10000) unlocked = true;
+            if (ach.id === "a3") {
+                const count = await Product.countDocuments({ sellerId: user._id });
+                if (count > 0) unlocked = true;
+            }
+
+            if (unlocked) {
+                user.unlockedAchievements.push(ach.id);
+                user.xp += ach.xpReward;
+                io.to(user._id.toString()).emit('notification', { message: `🏆 SUCCÈS DÉBLOQUÉ : ${ach.name} !` });
+                updated = true;
+            }
+        }
+    }
+    if (updated) await user.save();
+}
+
+async function addLog(action, details, io) {
+    const log = new Log({ action, details });
+    await log.save();
+    if (io) io.to('admins').emit('new_log', log);
+}
 
 // --- SELF-PING TO KEEP ALIVE ON RENDER ---
 const RENDER_EXTERNAL_URL = "https://mon-economie-server.onrender.com";
@@ -25,136 +171,58 @@ function keepAlive() {
         }).on('error', (err) => {
             console.error(`Self-ping error: ${err.message}`);
         });
-    }, 10 * 60 * 1000); // Ping toutes les 10 minutes
+    }, 10 * 60 * 1000);
 }
 
-// --- MARKET TRENDS AUTOMATION ---
-setInterval(() => {
+// --- MARKET TRENDS ---
+setInterval(async () => {
     const trends = ["Stable", "Hausse", "Baisse", "Inflation", "Krak Boursier"];
     globalSettings.marketTrend = trends[Math.floor(Math.random() * trends.length)];
-    io.emit('settings_updated', globalSettings);
-    io.emit('notification', { message: `La météo économique a changé : ${globalSettings.marketTrend} !` });
-}, 30 * 60 * 1000); // Toutes les 30 minutes
-
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] },
-    transports: ['websocket']
-});
-
-const JWT_SECRET = process.env.JWT_SECRET || "super_secret_key";
-
-// --- GLOBAL STATE ---
-let globalSettings = {
-    appName: "Économie Virtuelle",
-    currencySymbol: "$",
-    defaultBalance: 1000,
-    xpMultiplier: 1.0,
-    registrationEnabled: true,
-    maintenanceMode: false,
-    economyEvent: "Normal",
-    marketTrend: "Stable" // Stable, Hausse, Baisse
-};
-
-let users = [];
-let products = [
-    { id: "p1", name: "Pack Fondateur", description: "Un pack exclusif pour les premiers arrivés.", price: 0, stock: -1, category: "Événement", imageUrl: "https://cdn-icons-png.flaticon.com/512/1063/1063376.png", sellerId: "system", salesCount: 0, isLimited: true },
-    { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: -1, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png", sellerId: "system", salesCount: 0, isLimited: false },
-    { id: "p3", name: "Lingot d'Or", description: "Valeur refuge.", price: 5000, stock: 50, category: "Ressources", imageUrl: "https://cdn-icons-png.flaticon.com/512/2481/2481134.png", sellerId: "system", salesCount: 0, isLimited: false }
-];
-let achievements = [
-    { id: "a1", name: "Premier Pas", description: "Faire son premier achat", icon: "🌱", xpReward: 100 },
-    { id: "a2", name: "Capitaliste", description: "Atteindre 10 000 $ de solde", icon: "💰", xpReward: 500 },
-    { id: "a3", name: "Vendeur Né", description: "Mettre son premier objet en vente", icon: "📦", xpReward: 200 }
-];
-let messages = [];
-let logs = [];
-let transactions = [];
-let reports = [];
-let codes = [
-    { code: "START", reward: 500, uses: 100 }
-];
-let auctions = []; // { id, productId, sellerId, highestBid, highestBidderId, endTime }
-let friends = []; // { user1Id, user2Id, status: 'pending' | 'accepted' }
-let titles = [
-    { id: "t1", name: "Fondateur", rarity: "EXCLUSIF_ADMIN", color: "#FFD700", animation: "glow", icon: "👑" },
-    { id: "t2", name: "Nouveau", rarity: "COMMUN", color: "#FFFFFF", animation: "none", icon: "🌱" }
-];
-
-// --- INITIALISATION ---
-function calculateTotalValue(user) {
-    let inventoryValue = 0;
-    user.inventory.forEach(prodId => {
-        const p = products.find(item => item.id === prodId);
-        if (p) inventoryValue += p.price;
-    });
-    return user.balance + inventoryValue;
-}
-
-function checkAchievements(user, io) {
-    achievements.forEach(ach => {
-        if (!user.unlockedAchievements.includes(ach.id)) {
-            let unlocked = false;
-            if (ach.id === "a1" && user.inventory.length > 0) unlocked = true;
-            if (ach.id === "a2" && user.balance >= 10000) unlocked = true;
-            if (ach.id === "a3" && products.some(p => p.sellerId === user.id)) unlocked = true;
-
-            if (unlocked) {
-                user.unlockedAchievements.push(ach.id);
-                user.xp += ach.xpReward;
-                io.to(user.id).emit('notification', { message: `🏆 SUCCÈS DÉBLOQUÉ : ${ach.name} !` });
-                io.to(user.id).emit('current_user', user);
-            }
-        }
-    });
-}
-
-async function initAdmin() {
-    const hashedPassword = await bcrypt.hash("admin123", 10);
-    const admin = {
-        id: "admin-id", username: "admin", password: hashedPassword,
-        balance: 1000000, role: "SUPER_ADMIN", level: 100, xp: 0, reputation: 100,
-        title: "Fondateur", isBanned: false, status: "online", statusMessage: "👑 Créateur de l'économie",
-        badges: ["🛡️ Staff", "💎 Fondateur"], inventory: [], favorites: [], streak: 0, lastDaily: 0,
-        totalAccountValue: 1000000, lastSeen: Date.now()
-    };
-    if (!users.find(u => u.username === "admin")) users.push(admin);
-}
-initAdmin();
-
-function addLog(action, details) {
-    const log = { id: uuidv4(), action, details, timestamp: Date.now() };
-    logs.unshift(log);
-    if (logs.length > 500) logs.pop();
-    io.to('admins').emit('new_log', log);
-}
+    const io = app.get('io');
+    if (io) {
+        io.emit('settings_updated', globalSettings);
+        io.emit('notification', { message: `La météo économique a changé : ${globalSettings.marketTrend} !` });
+    }
+}, 30 * 60 * 1000);
 
 // --- API ---
 app.post('/register', async (req, res) => {
-    const { username, password } = req.body;
-    if (users.find(u => u.username === username)) return res.status(400).json({ error: "Pseudo pris" });
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const user = {
-        id: uuidv4(), username, password: hashedPassword, balance: globalSettings.defaultBalance, role: 'USER',
-        level: 1, xp: 0, reputation: 0, title: "Nouveau", isBanned: false, status: "online",
-        statusMessage: "Je commence l'aventure !", badges: [], inventory: [], unlockedAchievements: [], favorites: [],
-        streak: 0, lastDaily: 0, totalAccountValue: globalSettings.defaultBalance, lastSeen: Date.now()
-    };
-    users.push(user);
-    addLog("Auth", `Nouveau compte: ${username}`);
-    res.json({ token: jwt.sign({ userId: user.id }, JWT_SECRET), user });
+    try {
+        const { username, password } = req.body;
+        const existing = await User.findOne({ username });
+        if (existing) return res.status(400).json({ error: "Pseudo pris" });
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = new User({
+            username,
+            password: hashedPassword,
+            balance: globalSettings.defaultBalance,
+            totalAccountValue: globalSettings.defaultBalance,
+            statusMessage: "Je commence l'aventure !",
+            title: "Nouveau"
+        });
+        await newUser.save();
+        res.json({ token: jwt.sign({ userId: newUser._id }, JWT_SECRET), user: newUser });
+    } catch (e) { res.status(500).json({ error: "Erreur serveur" }); }
 });
 
 app.post('/login', async (req, res) => {
-    const { username, password } = req.body;
-    const user = users.find(u => u.username === username);
-    if (user && !user.isBanned && await bcrypt.compare(password, user.password)) {
-        res.json({ token: jwt.sign({ userId: user.id }, JWT_SECRET), user });
-    } else if (user && user.isBanned) res.status(403).json({ error: "Banni" });
-    else res.status(401).json({ error: "Identifiants invalides" });
+    try {
+        const { username, password } = req.body;
+        const user = await User.findOne({ username });
+        if (user && !user.isBanned && await bcrypt.compare(password, user.password)) {
+            res.json({ token: jwt.sign({ userId: user._id }, JWT_SECRET), user });
+        } else if (user && user.isBanned) res.status(403).json({ error: "Banni" });
+        else res.status(401).json({ error: "Identifiants invalides" });
+    } catch (e) { res.status(500).json({ error: "Erreur serveur" }); }
 });
 
-// --- ENGINE ---
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] }, transports: ['websocket'] });
+app.set('io', io);
+
+const JWT_SECRET = process.env.JWT_SECRET || "super_secret_key";
+
 io.use((socket, next) => {
     const token = socket.handshake.auth.token;
     if (!token) return next(new Error("Auth error"));
@@ -165,265 +233,144 @@ io.use((socket, next) => {
     });
 });
 
-io.on('connection', (socket) => {
-    const user = users.find(u => u.id === socket.userId);
+io.on('connection', async (socket) => {
+    const user = await User.findById(socket.userId);
     if (!user) return;
 
     user.status = "online";
     user.lastSeen = Date.now();
-    socket.join(user.id);
+    await user.save();
+
+    socket.join(user._id.toString());
     if (user.role !== 'USER') socket.join('admins');
 
-    io.emit('user_status', { userId: user.id, status: "online" });
+    io.emit('user_status', { userId: user._id, status: "online" });
+
+    const currentProducts = await Product.find();
+    const currentAuctions = await Auction.find({ isFinished: false });
+    const leaderboard = await User.find().sort({ balance: -1 }).limit(20);
+    const publicUsers = await User.find({}, 'username status statusMessage level').limit(50);
+    const lastMessages = await Message.find({ receiverId: 'global' }).sort({ timestamp: -1 }).limit(50);
 
     socket.emit('initial_data', {
-        currentUser: user, products, titles, settings: globalSettings, achievements,
-        leaderboard: users.sort((a, b) => b.balance - a.balance).slice(0, 20),
-        messages: messages.slice(-50)
+        currentUser: user,
+        products: currentProducts,
+        titles,
+        settings: globalSettings,
+        achievements,
+        leaderboard,
+        publicUsers,
+        messages: lastMessages.reverse(),
+        auctions: currentAuctions
     });
 
-    if (user.role !== 'USER') socket.emit('admin_data', { users, logs, transactions, reports });
+    if (user.role !== 'USER') {
+        const allUsers = await User.find();
+        const allLogs = await Log.find().sort({ timestamp: -1 }).limit(100);
+        const allReports = await Report.find().sort({ timestamp: -1 });
+        socket.emit('admin_data', { users: allUsers, logs: allLogs, reports: allReports });
+    }
 
-    // --- ENCHÈRES & TENDANCES ---
-    socket.emit('market_data', { trend: globalSettings.marketTrend, auctions });
-
-    // --- ACTIONS JOUEURS ---
-    socket.on('update_status', (data) => {
+    socket.on('update_status', async (data) => {
         user.statusMessage = data.message;
-        io.to(user.id).emit('current_user', user);
-        addLog("Social", `${user.username} a changé son statut.`);
+        await user.save();
+        io.to(user._id.toString()).emit('current_user', user);
     });
 
-    socket.on('claim_daily', () => {
+    socket.on('claim_daily', async () => {
         const now = Date.now();
-        const oneDay = 24 * 60 * 60 * 1000;
-        if (now - user.lastDaily > oneDay) {
-            if (now - user.lastDaily < oneDay * 2) user.streak++; else user.streak = 1;
+        if (now - user.lastDaily > 24 * 3600 * 1000) {
+            user.streak = (now - user.lastDaily < 48 * 3600 * 1000) ? user.streak + 1 : 1;
             const reward = 100 + (user.streak * 50);
             user.balance += reward;
-            user.totalAccountValue = calculateTotalValue(user);
             user.lastDaily = now;
-            io.to(user.id).emit('current_user', user);
-            io.to(user.id).emit('notification', { message: `Cadeau: +${reward} $ (Série: ${user.streak}j)` });
-        } else {
-            socket.emit('notification', { message: "Déjà récupéré aujourd'hui !" });
-        }
+            user.totalAccountValue = await calculateTotalValue(user);
+            await user.save();
+            io.to(user._id.toString()).emit('current_user', user);
+            socket.emit('notification', { message: `🎁 Cadeau : +${reward} $` });
+        } else socket.emit('notification', { message: "Déjà récupéré !" });
     });
 
-    socket.on('gift_money', (data) => {
-        const target = users.find(u => u.id === data.targetId);
+    socket.on('claim_wheel', async () => {
+        const now = Date.now();
+        if (now - user.lastWheel > 24 * 3600 * 1000) {
+            const reward = Math.floor(Math.random() * 450) + 50;
+            user.balance += reward;
+            user.lastWheel = now;
+            await user.save();
+            io.to(user._id.toString()).emit('current_user', user);
+            socket.emit('notification', { message: `🎡 Roue : +${reward} $ !` });
+        } else socket.emit('notification', { message: "Revenez demain !" });
+    });
+
+    socket.on('claim_chest', async () => {
+        const now = Date.now();
+        if (now - user.lastChest > 24 * 3600 * 1000) {
+            const reward = Math.floor(Math.random() * 800) + 200;
+            user.balance += reward;
+            user.lastChest = now;
+            await user.save();
+            io.to(user._id.toString()).emit('current_user', user);
+            socket.emit('notification', { message: `📦 Coffre : +${reward} $ !` });
+        } else socket.emit('notification', { message: "Revenez demain !" });
+    });
+
+    socket.on('gift_money', async (data) => {
+        const target = await User.findById(data.targetId);
         const amount = parseFloat(data.amount);
         if (target && amount > 0 && user.balance >= amount) {
             user.balance -= amount;
             target.balance += amount;
-            user.totalAccountValue = calculateTotalValue(user);
-            target.totalAccountValue = calculateTotalValue(target);
-
-            checkAchievements(user, io);
-            checkAchievements(target, io);
-
-            io.to(user.id).emit('current_user', user);
-            io.to(target.id).emit('current_user', target);
-            io.to(target.id).emit('notification', { message: `${user.username} vous a envoyé ${amount} $ !` });
-            addLog("Transaction", `${user.username} a donné ${amount} $ à ${target.username}`);
+            await user.save(); await target.save();
+            io.to(user._id.toString()).emit('current_user', user);
+            io.to(target._id.toString()).emit('current_user', target);
+            io.to(target._id.toString()).emit('notification', { message: `${user.username} vous a envoyé ${amount} $ !` });
+            addLog("Transaction", `${user.username} -> ${target.username} (${amount}$)`, io);
         }
     });
 
-    socket.on('redeem_code', (data) => {
-        const codeObj = codes.find(c => c.code === data.code && c.uses > 0);
-        if (codeObj) {
-            codeObj.uses--;
-            user.balance += codeObj.reward;
-            user.totalAccountValue = calculateTotalValue(user);
-            io.to(user.id).emit('current_user', user);
-            socket.emit('notification', { message: `Code validé ! +${codeObj.reward} $` });
-        } else {
-            socket.emit('notification', { message: "Code invalide ou expiré." });
-        }
-    });
-
-    socket.on('buy_product', (data) => {
-        const product = products.find(p => p.id === data.productId);
-        if (!product) return;
-
-        const alreadyOwned = user.inventory.includes(product.id);
-        const canAfford = user.balance >= product.price;
-        const hasStock = product.stock > 0 || product.stock === -1;
-
-        if (!alreadyOwned && canAfford && hasStock) {
+    socket.on('buy_product', async (data) => {
+        const product = await Product.findById(data.productId);
+        if (product && user.balance >= product.price && (product.stock > 0 || product.stock === -1)) {
             if (product.stock !== -1) product.stock--;
+            await product.save();
             user.balance -= product.price;
-            user.inventory.push(product.id);
-            user.totalAccountValue = calculateTotalValue(user);
-
-            // Gain XP
-            user.xp += 50 * globalSettings.xpMultiplier;
-            if (user.xp >= user.level * 200) {
-                user.level++;
-                user.xp = 0;
-                io.to(user.id).emit('notification', { message: `BRAVO ! Niveau ${user.level} atteint !` });
-            }
-
-            // Notifier le vendeur
-            const seller = users.find(u => u.id === product.sellerId);
+            user.inventory.push(product._id.toString());
+            user.xp += 50;
+            if (user.xp >= user.level * 200) { user.level++; user.xp = 0; }
+            await user.save();
+            const seller = await User.findById(product.sellerId);
             if (seller) {
-                seller.balance += product.price;
-                seller.totalAccountValue = calculateTotalValue(seller);
-                io.to(seller.id).emit('current_user', seller);
-                io.to(seller.id).emit('notification', { message: `Vente : ${user.username} a acheté ${product.name} !` });
+                seller.balance += product.price; await seller.save();
+                io.to(seller._id.toString()).emit('current_user', seller);
+                io.to(seller._id.toString()).emit('notification', { message: `Vendu : ${product.name} !` });
             }
-
-            io.to(user.id).emit('current_user', user);
+            io.to(user._id.toString()).emit('current_user', user);
             io.emit('product_updated', product);
             checkAchievements(user, io);
-            addLog("Market", `${user.username} a acheté ${product.name}`);
-        } else if (alreadyOwned) {
-            socket.emit('notification', { message: "Vous possédez déjà cet article !" });
-        } else if (!hasStock) {
-            socket.emit('notification', { message: "Article épuisé !" });
-        } else {
-            socket.emit('notification', { message: "Solde insuffisant !" });
         }
     });
 
-    socket.on('admin_add_product', (data) => {
-        const newProduct = {
-            id: uuidv4(),
-            name: data.name,
-            description: data.description,
-            price: parseFloat(data.price),
-            stock: parseInt(data.stock), // -1 pour infini
-            category: data.category,
-            imageUrl: data.imageUrl || "https://cdn-icons-png.flaticon.com/512/1170/1170577.png",
-            sellerId: user.id,
-            sellerName: user.username,
-            salesCount: 0,
-            createdAt: Date.now()
-        };
-        products.push(newProduct);
-        io.emit('products_list', products);
-        checkAchievements(user, io);
-        addLog("Market", `${user.username} a mis en vente : ${newProduct.name}`);
-    });
-
-    socket.on('admin_delete_product', (data) => {
-        if (user.role !== 'USER') {
-            products = products.filter(p => p.id !== data.productId);
-            io.emit('products_list', products);
-            addLog("Admin", `${user.username} a supprimé un produit`);
-        }
-    });
-
-    socket.on('admin_modify_balance', (data) => {
-        if (user.role !== 'USER') {
-            const target = users.find(u => u.id === data.userId);
-            if (target) {
-                target.balance += parseFloat(data.amount);
-                io.to(target.id).emit('current_user', target);
-                io.to('admins').emit('admin_user_updated', target);
-                addLog("Admin", `${user.username} a ajusté le solde de ${target.username} de ${data.amount}`);
-            }
-        }
-    });
-
-    socket.on('admin_global_announcement', (data) => {
-        if (user.role !== 'USER') {
-            io.emit('global_announcement', { text: data.text });
-            addLog("Admin", `Annonce globale: ${data.text}`);
-        }
-    });
-
-    socket.on('admin_ban_user', (data) => {
-        if (user.role !== 'USER') {
-            const target = users.find(u => u.id === data.userId);
-            if (target && target.role === 'USER') {
-                target.isBanned = true;
-                io.to(target.id).emit('banned');
-                io.to('admins').emit('admin_user_updated', target);
-                addLog("Admin", `${user.username} a banni ${target.username}`);
-            }
-        }
-    });
-
-    socket.on('send_message', (data) => {
-        const msg = { id: uuidv4(), senderId: user.id, senderName: user.username, content: data.content, timestamp: Date.now() };
-        messages.push(msg);
+    socket.on('send_message', async (data) => {
+        const msg = new Message({ senderId: user._id, senderName: user.username, content: data.content });
+        await msg.save();
         io.emit('new_message', msg);
     });
 
-    socket.on('report_user', (data) => {
-        const report = { id: uuidv4(), reporter: user.username, targetId: data.userId, reason: data.reason, timestamp: Date.now() };
-        reports.unshift(report);
+    socket.on('report_user', async (data) => {
+        const report = new Report({ reporter: user.username, targetId: data.userId, reason: data.reason });
+        await report.save();
         io.to('admins').emit('new_report', report);
-        io.to(user.id).emit('notification', { message: "Signalement envoyé aux admins." });
     });
 
-    // --- ACTIONS ADMIN ---
-    socket.on('admin_event', (event) => {
-        if (user.role !== 'USER') {
-            globalSettings.economyEvent = event;
-            io.emit('settings_updated', globalSettings);
-            io.emit('global_announcement', { text: `ÉVÉNEMENT EN COURS: ${event} !` });
-        }
-    });
-
-    socket.on('admin_give_badge', (data) => {
-        if (user.role === 'SUPER_ADMIN') {
-            const target = users.find(u => u.id === data.userId);
-            if (target) {
-                target.badges.push(data.badge);
-                io.to(target.id).emit('current_user', target);
-                addLog("Admin", `Badge ${data.badge} donné à ${target.username}`);
-            }
-        }
-    });
-
-    socket.on('add_friend', (data) => {
-        const target = users.find(u => u.id === data.targetId);
-        if (target && target.id !== user.id) {
-            friends.push({ user1Id: user.id, user2Id: target.id, status: 'pending' });
-            io.to(target.id).emit('notification', { message: `${user.username} vous a envoyé une demande d'ami !` });
-            socket.emit('notification', { message: "Demande envoyée !" });
-        }
-    });
-
-    socket.on('start_auction', (data) => {
-        const product = products.find(p => p.id === data.productId && p.sellerId === user.id);
-        if (product) {
-            const auction = {
-                id: uuidv4(),
-                productId: product.id,
-                productName: product.name,
-                sellerId: user.id,
-                sellerName: user.username,
-                highestBid: product.price,
-                highestBidderId: null,
-                endTime: Date.now() + (data.durationMinutes * 60000)
-            };
-            auctions.push(auction);
-            io.emit('new_auction', auction);
-            addLog("Market", `${user.username} a lancé une enchère pour ${product.name}`);
-        }
-    });
-
-    socket.on('bid_auction', (data) => {
-        const auction = auctions.find(a => a.id === data.auctionId);
-        const bid = parseFloat(data.amount);
-        if (auction && bid > auction.highestBid && user.balance >= bid) {
-            auction.highestBid = bid;
-            auction.highestBidderId = user.id;
-            auction.highestBidderName = user.username;
-            io.emit('auction_update', auction);
-        }
-    });
-
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
         user.status = "offline";
-        io.emit('user_status', { userId: user.id, status: "offline" });
+        await user.save();
+        io.emit('user_status', { userId: user._id, status: "offline" });
     });
 });
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
     console.log("🚀 ECO-SYSTEM FULL LOADED");
-    keepAlive(); // Démarrer le système d'auto-réveil
+    keepAlive();
 });
