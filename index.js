@@ -62,6 +62,11 @@ let products = [
     { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: -1, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png", sellerId: "system", salesCount: 0, isLimited: false },
     { id: "p3", name: "Lingot d'Or", description: "Valeur refuge.", price: 5000, stock: 50, category: "Ressources", imageUrl: "https://cdn-icons-png.flaticon.com/512/2481/2481134.png", sellerId: "system", salesCount: 0, isLimited: false }
 ];
+let achievements = [
+    { id: "a1", name: "Premier Pas", description: "Faire son premier achat", icon: "🌱", xpReward: 100 },
+    { id: "a2", name: "Capitaliste", description: "Atteindre 10 000 $ de solde", icon: "💰", xpReward: 500 },
+    { id: "a3", name: "Vendeur Né", description: "Mettre son premier objet en vente", icon: "📦", xpReward: 200 }
+];
 let messages = [];
 let logs = [];
 let transactions = [];
@@ -84,6 +89,24 @@ function calculateTotalValue(user) {
         if (p) inventoryValue += p.price;
     });
     return user.balance + inventoryValue;
+}
+
+function checkAchievements(user, io) {
+    achievements.forEach(ach => {
+        if (!user.unlockedAchievements.includes(ach.id)) {
+            let unlocked = false;
+            if (ach.id === "a1" && user.inventory.length > 0) unlocked = true;
+            if (ach.id === "a2" && user.balance >= 10000) unlocked = true;
+            if (ach.id === "a3" && products.some(p => p.sellerId === user.id)) unlocked = true;
+
+            if (unlocked) {
+                user.unlockedAchievements.push(ach.id);
+                user.xp += ach.xpReward;
+                io.to(user.id).emit('notification', { message: `🏆 SUCCÈS DÉBLOQUÉ : ${ach.name} !` });
+                io.to(user.id).emit('current_user', user);
+            }
+        }
+    });
 }
 
 async function initAdmin() {
@@ -114,7 +137,7 @@ app.post('/register', async (req, res) => {
     const user = {
         id: uuidv4(), username, password: hashedPassword, balance: globalSettings.defaultBalance, role: 'USER',
         level: 1, xp: 0, reputation: 0, title: "Nouveau", isBanned: false, status: "online",
-        statusMessage: "Je commence l'aventure !", badges: [], inventory: [], favorites: [],
+        statusMessage: "Je commence l'aventure !", badges: [], inventory: [], unlockedAchievements: [], favorites: [],
         streak: 0, lastDaily: 0, totalAccountValue: globalSettings.defaultBalance, lastSeen: Date.now()
     };
     users.push(user);
@@ -154,7 +177,7 @@ io.on('connection', (socket) => {
     io.emit('user_status', { userId: user.id, status: "online" });
 
     socket.emit('initial_data', {
-        currentUser: user, products, titles, settings: globalSettings,
+        currentUser: user, products, titles, settings: globalSettings, achievements,
         leaderboard: users.sort((a, b) => b.balance - a.balance).slice(0, 20),
         messages: messages.slice(-50)
     });
@@ -195,6 +218,9 @@ io.on('connection', (socket) => {
             target.balance += amount;
             user.totalAccountValue = calculateTotalValue(user);
             target.totalAccountValue = calculateTotalValue(target);
+
+            checkAchievements(user, io);
+            checkAchievements(target, io);
 
             io.to(user.id).emit('current_user', user);
             io.to(target.id).emit('current_user', target);
@@ -249,6 +275,7 @@ io.on('connection', (socket) => {
 
             io.to(user.id).emit('current_user', user);
             io.emit('product_updated', product);
+            checkAchievements(user, io);
             addLog("Market", `${user.username} a acheté ${product.name}`);
         } else if (alreadyOwned) {
             socket.emit('notification', { message: "Vous possédez déjà cet article !" });
@@ -275,6 +302,7 @@ io.on('connection', (socket) => {
         };
         products.push(newProduct);
         io.emit('products_list', products);
+        checkAchievements(user, io);
         addLog("Market", `${user.username} a mis en vente : ${newProduct.name}`);
     });
 
