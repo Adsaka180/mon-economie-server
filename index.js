@@ -38,6 +38,17 @@ const UserSchema = new mongoose.Schema({
     isBanned: { type: Boolean, default: false },
     lastSeen: { type: Number, default: Date.now }
 });
+
+UserSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        delete ret._id;
+        delete ret.__v;
+        delete ret.password;
+        return ret;
+    }
+});
+
 const User = mongoose.model('User', UserSchema);
 
 const ProductSchema = new mongoose.Schema({
@@ -52,6 +63,16 @@ const ProductSchema = new mongoose.Schema({
     isLimited: Boolean,
     createdAt: { type: Number, default: Date.now }
 });
+
+ProductSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        delete ret._id;
+        delete ret.__v;
+        return ret;
+    }
+});
+
 const Product = mongoose.model('Product', ProductSchema);
 
 const AuctionSchema = new mongoose.Schema({
@@ -65,6 +86,16 @@ const AuctionSchema = new mongoose.Schema({
     endTime: Number,
     isFinished: { type: Boolean, default: false }
 });
+
+AuctionSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        delete ret._id;
+        delete ret.__v;
+        return ret;
+    }
+});
+
 const Auction = mongoose.model('Auction', AuctionSchema);
 
 const LogSchema = new mongoose.Schema({
@@ -72,6 +103,16 @@ const LogSchema = new mongoose.Schema({
     details: String,
     timestamp: { type: Number, default: Date.now }
 });
+
+LogSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        delete ret._id;
+        delete ret.__v;
+        return ret;
+    }
+});
+
 const Log = mongoose.model('Log', LogSchema);
 
 const MessageSchema = new mongoose.Schema({
@@ -81,6 +122,16 @@ const MessageSchema = new mongoose.Schema({
     content: String,
     timestamp: { type: Number, default: Date.now }
 });
+
+MessageSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        delete ret._id;
+        delete ret.__v;
+        return ret;
+    }
+});
+
 const Message = mongoose.model('Message', MessageSchema);
 
 const ReportSchema = new mongoose.Schema({
@@ -89,6 +140,16 @@ const ReportSchema = new mongoose.Schema({
     reason: String,
     timestamp: { type: Number, default: Date.now }
 });
+
+ReportSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        delete ret._id;
+        delete ret.__v;
+        return ret;
+    }
+});
+
 const Report = mongoose.model('Report', ReportSchema);
 
 // --- GLOBAL STATE ---
