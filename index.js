@@ -122,10 +122,25 @@ const codes = [
 async function calculateTotalValue(user) {
     let inventoryValue = 0;
     for (const prodId of user.inventory) {
-        const p = await Product.findById(prodId);
-        if (p) inventoryValue += p.price;
+        try {
+            const p = await Product.findById(prodId);
+            if (p) {
+                const multiplier = getMarketMultiplier();
+                inventoryValue += (p.price * multiplier);
+            }
+        } catch(e) {}
     }
     return user.balance + inventoryValue;
+}
+
+function getMarketMultiplier() {
+    switch (globalSettings.marketTrend) {
+        case "Inflation": return 2.0;
+        case "Hausse": return 1.3;
+        case "Baisse": return 0.7;
+        case "Krak Boursier": return 0.3;
+        default: return 1.0;
+    }
 }
 
 async function checkAchievements(user, io) {
@@ -331,23 +346,44 @@ io.on('connection', async (socket) => {
 
     socket.on('buy_product', async (data) => {
         const product = await Product.findById(data.productId);
-        if (product && user.balance >= product.price && (product.stock > 0 || product.stock === -1)) {
+        if (!product) return;
+
+        const multiplier = getMarketMultiplier();
+        const currentPrice = product.price * multiplier;
+        const alreadyOwned = user.inventory.includes(product._id.toString());
+        const canAfford = user.balance >= currentPrice;
+        const hasStock = product.stock > 0 || product.stock === -1;
+
+        if (!alreadyOwned && canAfford && hasStock) {
             if (product.stock !== -1) product.stock--;
             await product.save();
-            user.balance -= product.price;
+
+            user.balance -= currentPrice;
             user.inventory.push(product._id.toString());
+            user.totalAccountValue = await calculateTotalValue(user);
+
             user.xp += 50;
             if (user.xp >= user.level * 200) { user.level++; user.xp = 0; }
             await user.save();
+
             const seller = await User.findById(product.sellerId);
             if (seller) {
-                seller.balance += product.price; await seller.save();
+                seller.balance += currentPrice;
+                seller.totalAccountValue = await calculateTotalValue(seller);
+                await seller.save();
                 io.to(seller._id.toString()).emit('current_user', seller);
-                io.to(seller._id.toString()).emit('notification', { message: `Vendu : ${product.name} !` });
+                io.to(seller._id.toString()).emit('notification', { message: `Vendu : ${product.name} pour ${currentPrice.toInt()} $ !` });
             }
+
             io.to(user._id.toString()).emit('current_user', user);
             io.emit('product_updated', product);
             checkAchievements(user, io);
+        } else if (alreadyOwned) {
+            socket.emit('notification', { message: "Vous possédez déjà cet article !" });
+        } else if (!hasStock) {
+            socket.emit('notification', { message: "Article épuisé !" });
+        } else {
+            socket.emit('notification', { message: `Il vous manque ${(currentPrice - user.balance).toInt()} $ !` });
         }
     });
 
@@ -361,6 +397,60 @@ io.on('connection', async (socket) => {
         const report = new Report({ reporter: user.username, targetId: data.userId, reason: data.reason });
         await report.save();
         io.to('admins').emit('new_report', report);
+    });
+
+    socket.on('start_auction', async (data) => {
+        const product = await Product.findOne({ _id: data.productId, sellerId: user._id });
+        if (product) {
+            const auction = new Auction({
+                productId: product._id,
+                productName: product.name,
+                sellerId: user._id,
+                sellerName: user.username,
+                highestBid: product.price * getMarketMultiplier(),
+                endTime: Date.now() + (data.durationMinutes * 60000)
+            });
+            await auction.save();
+            io.emit('new_auction', auction);
+            addLog("Market", `${user.username} a lancé une enchère pour ${product.name}`, io);
+        }
+    });
+
+    socket.on('bid_auction', async (data) => {
+        const auction = await Auction.findById(data.auctionId);
+        const bid = parseFloat(data.amount);
+        if (auction && !auction.isFinished && bid > auction.highestBid && user.balance >= bid) {
+            auction.highestBid = bid;
+            auction.highestBidderId = user._id;
+            auction.highestBidderName = user.username;
+            await auction.save();
+            io.emit('auction_update', auction);
+        }
+    });
+
+    socket.on('add_friend', async (data) => {
+        const target = await User.findById(data.targetId);
+        if (target && target._id.toString() !== user._id.toString()) {
+            const already = user.friends.some(f => f.userId === target._id.toString());
+            if (!already) {
+                user.friends.push({ userId: target._id.toString(), status: 'pending' });
+                await user.save();
+                io.to(target._id.toString()).emit('notification', { message: `${user.username} vous a envoyé une demande d'ami !` });
+                socket.emit('notification', { message: "Demande envoyée !" });
+            }
+        }
+    });
+
+    socket.on('like_user', async (data) => {
+        const target = await User.findById(data.userId);
+        if (target && target._id.toString() !== user._id.toString()) {
+            target.reputation += 1;
+            target.xp += 10;
+            await target.save();
+            io.to(target._id.toString()).emit('current_user', target);
+            io.to(target._id.toString()).emit('notification', { message: `💖 ${user.username} a aimé votre profil !` });
+            socket.emit('notification', { message: "Mention J'aime envoyée !" });
+        }
     });
 
     socket.on('disconnect', async () => {
