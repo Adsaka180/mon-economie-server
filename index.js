@@ -49,8 +49,8 @@ let globalSettings = {
 
 let users = [];
 let products = [
-    { id: "p1", name: "Pack Fondateur", description: "Un pack exclusif pour les premiers arrivés.", price: 0, stock: 100, category: "Événement", imageUrl: "https://cdn-icons-png.flaticon.com/512/1063/1063376.png", sellerId: "system", salesCount: 0 },
-    { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: 10, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png", sellerId: "system", salesCount: 0 },
+    { id: "p1", name: "Pack Fondateur", description: "Un pack exclusif pour les premiers arrivés.", price: 0, stock: -1, category: "Événement", imageUrl: "https://cdn-icons-png.flaticon.com/512/1063/1063376.png", sellerId: "system", salesCount: 0 },
+    { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: -1, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png", sellerId: "system", salesCount: 0 },
     { id: "p3", name: "Lingot d'Or", description: "Valeur refuge.", price: 5000, stock: 50, category: "Ressources", imageUrl: "https://cdn-icons-png.flaticon.com/512/2481/2481134.png", sellerId: "system", salesCount: 0 }
 ];
 let messages = [];
@@ -69,7 +69,7 @@ async function initAdmin() {
         id: "admin-id", username: "admin", password: hashedPassword,
         balance: 1000000, role: "SUPER_ADMIN", level: 100, xp: 0, reputation: 100,
         title: "Fondateur", isBanned: false, status: "offline", bio: "Le créateur.",
-        badges: ["🛡️ Staff", "💎 Fondateur"], favorites: [], streak: 0, lastDaily: 0
+        badges: ["🛡️ Staff", "💎 Fondateur"], inventory: [], favorites: [], streak: 0, lastDaily: 0
     };
     if (!users.find(u => u.username === "admin")) users.push(admin);
 }
@@ -90,7 +90,7 @@ app.post('/register', async (req, res) => {
     const user = {
         id: uuidv4(), username, password: hashedPassword, balance: globalSettings.defaultBalance, role: 'USER',
         level: 1, xp: 0, reputation: 0, title: "Nouveau", isBanned: false, status: "offline",
-        badges: [], favorites: [], streak: 0, lastDaily: 0
+        badges: [], inventory: [], favorites: [], streak: 0, lastDaily: 0
     };
     users.push(user);
     addLog("Auth", `Nouveau compte: ${username}`);
@@ -153,15 +153,93 @@ io.on('connection', (socket) => {
 
     socket.on('buy_product', (data) => {
         const product = products.find(p => p.id === data.productId);
-        if (product && product.stock > 0 && user.balance >= product.price) {
-            product.stock--;
+        if (!product) return;
+
+        const alreadyOwned = user.inventory.includes(product.id);
+        const canAfford = user.balance >= product.price;
+        const hasStock = product.stock > 0 || product.stock === -1;
+
+        if (!alreadyOwned && canAfford && hasStock) {
+            if (product.stock !== -1) product.stock--;
             user.balance -= product.price;
+            user.inventory.push(product.id);
             user.xp += 50 * globalSettings.xpMultiplier;
-            if (user.xp >= user.level * 200) { user.level++; user.xp = 0; }
+
+            if (user.xp >= user.level * 200) {
+                user.level++;
+                user.xp = 0;
+                io.to(user.id).emit('notification', { message: `Bravo ! Vous passez niveau ${user.level} !` });
+            }
 
             io.to(user.id).emit('current_user', user);
             io.emit('product_updated', product);
             addLog("Market", `${user.username} a acheté ${product.name}`);
+        } else if (alreadyOwned) {
+            socket.emit('notification', { message: "Vous possédez déjà cet article !" });
+        } else if (!hasStock) {
+            socket.emit('notification', { message: "Article épuisé !" });
+        } else {
+            socket.emit('notification', { message: "Solde insuffisant !" });
+        }
+    });
+
+    socket.on('admin_add_product', (data) => {
+        if (user.role !== 'USER') {
+            const newProduct = {
+                id: uuidv4(),
+                name: data.name,
+                description: data.description,
+                price: parseFloat(data.price),
+                stock: parseInt(data.stock), // -1 pour infini
+                category: data.category,
+                imageUrl: data.imageUrl || "https://cdn-icons-png.flaticon.com/512/1170/1170577.png",
+                sellerId: user.id,
+                sellerName: user.username,
+                salesCount: 0,
+                createdAt: Date.now()
+            };
+            products.push(newProduct);
+            io.emit('products_list', products);
+            addLog("Admin", `${user.username} a créé le produit ${newProduct.name}`);
+        }
+    });
+
+    socket.on('admin_delete_product', (data) => {
+        if (user.role !== 'USER') {
+            products = products.filter(p => p.id !== data.productId);
+            io.emit('products_list', products);
+            addLog("Admin", `${user.username} a supprimé un produit`);
+        }
+    });
+
+    socket.on('admin_modify_balance', (data) => {
+        if (user.role !== 'USER') {
+            const target = users.find(u => u.id === data.userId);
+            if (target) {
+                target.balance += parseFloat(data.amount);
+                io.to(target.id).emit('current_user', target);
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("Admin", `${user.username} a ajusté le solde de ${target.username} de ${data.amount}`);
+            }
+        }
+    });
+
+    socket.on('admin_global_announcement', (data) => {
+        if (user.role !== 'USER') {
+            io.emit('global_announcement', { text: data.text });
+            addLog("Admin", `Annonce globale: ${data.text}`);
+        }
+    });
+
+    socket.on('admin_ban_user', (data) => {
+        if (user.role !== 'USER') {
+            const target = users.find(u => u.id === data.userId);
+            if (target && target.role === 'USER') {
+                target.isBanned = true;
+                io.to(target.id).emit('banned');
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("Admin", `${user.username} a banni ${target.username}`);
+            }
         }
     });
 
