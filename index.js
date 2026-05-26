@@ -44,32 +44,46 @@ let globalSettings = {
     xpMultiplier: 1.0,
     registrationEnabled: true,
     maintenanceMode: false,
-    economyEvent: "Normal" // Normal, Inflation (prix x2), Bonus XP (xp x2)
+    economyEvent: "Normal",
+    marketTrend: "Stable" // Stable, Hausse, Baisse
 };
 
 let users = [];
 let products = [
-    { id: "p1", name: "Pack Fondateur", description: "Un pack exclusif pour les premiers arrivés.", price: 0, stock: -1, category: "Événement", imageUrl: "https://cdn-icons-png.flaticon.com/512/1063/1063376.png", sellerId: "system", salesCount: 0 },
-    { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: -1, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png", sellerId: "system", salesCount: 0 },
-    { id: "p3", name: "Lingot d'Or", description: "Valeur refuge.", price: 5000, stock: 50, category: "Ressources", imageUrl: "https://cdn-icons-png.flaticon.com/512/2481/2481134.png", sellerId: "system", salesCount: 0 }
+    { id: "p1", name: "Pack Fondateur", description: "Un pack exclusif pour les premiers arrivés.", price: 0, stock: -1, category: "Événement", imageUrl: "https://cdn-icons-png.flaticon.com/512/1063/1063376.png", sellerId: "system", salesCount: 0, isLimited: true },
+    { id: "p2", name: "Grade VIP+", description: "Deviens une légende de l'économie.", price: 15000, stock: -1, category: "Grades", imageUrl: "https://cdn-icons-png.flaticon.com/512/2583/2583344.png", sellerId: "system", salesCount: 0, isLimited: false },
+    { id: "p3", name: "Lingot d'Or", description: "Valeur refuge.", price: 5000, stock: 50, category: "Ressources", imageUrl: "https://cdn-icons-png.flaticon.com/512/2481/2481134.png", sellerId: "system", salesCount: 0, isLimited: false }
 ];
 let messages = [];
 let logs = [];
 let transactions = [];
 let reports = [];
+let codes = [
+    { code: "START", reward: 500, uses: 100 }
+];
 let titles = [
     { id: "t1", name: "Fondateur", rarity: "EXCLUSIF_ADMIN", color: "#FFD700", animation: "glow", icon: "👑" },
     { id: "t2", name: "Nouveau", rarity: "COMMUN", color: "#FFFFFF", animation: "none", icon: "🌱" }
 ];
 
 // --- INITIALISATION ---
+function calculateTotalValue(user) {
+    let inventoryValue = 0;
+    user.inventory.forEach(prodId => {
+        const p = products.find(item => item.id === prodId);
+        if (p) inventoryValue += p.price;
+    });
+    return user.balance + inventoryValue;
+}
+
 async function initAdmin() {
     const hashedPassword = await bcrypt.hash("admin123", 10);
     const admin = {
         id: "admin-id", username: "admin", password: hashedPassword,
         balance: 1000000, role: "SUPER_ADMIN", level: 100, xp: 0, reputation: 100,
-        title: "Fondateur", isBanned: false, status: "offline", bio: "Le créateur.",
-        badges: ["🛡️ Staff", "💎 Fondateur"], inventory: [], favorites: [], streak: 0, lastDaily: 0
+        title: "Fondateur", isBanned: false, status: "online", statusMessage: "👑 Créateur de l'économie",
+        badges: ["🛡️ Staff", "💎 Fondateur"], inventory: [], favorites: [], streak: 0, lastDaily: 0,
+        totalAccountValue: 1000000, lastSeen: Date.now()
     };
     if (!users.find(u => u.username === "admin")) users.push(admin);
 }
@@ -89,8 +103,9 @@ app.post('/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = {
         id: uuidv4(), username, password: hashedPassword, balance: globalSettings.defaultBalance, role: 'USER',
-        level: 1, xp: 0, reputation: 0, title: "Nouveau", isBanned: false, status: "offline",
-        badges: [], inventory: [], favorites: [], streak: 0, lastDaily: 0
+        level: 1, xp: 0, reputation: 0, title: "Nouveau", isBanned: false, status: "online",
+        statusMessage: "Je commence l'aventure !", badges: [], inventory: [], favorites: [],
+        streak: 0, lastDaily: 0, totalAccountValue: globalSettings.defaultBalance, lastSeen: Date.now()
     };
     users.push(user);
     addLog("Auth", `Nouveau compte: ${username}`);
@@ -122,6 +137,7 @@ io.on('connection', (socket) => {
     if (!user) return;
 
     user.status = "online";
+    user.lastSeen = Date.now();
     socket.join(user.id);
     if (user.role !== 'USER') socket.join('admins');
 
@@ -136,6 +152,12 @@ io.on('connection', (socket) => {
     if (user.role !== 'USER') socket.emit('admin_data', { users, logs, transactions, reports });
 
     // --- ACTIONS JOUEURS ---
+    socket.on('update_status', (data) => {
+        user.statusMessage = data.message;
+        io.to(user.id).emit('current_user', user);
+        addLog("Social", `${user.username} a changé son statut.`);
+    });
+
     socket.on('claim_daily', () => {
         const now = Date.now();
         const oneDay = 24 * 60 * 60 * 1000;
@@ -143,11 +165,41 @@ io.on('connection', (socket) => {
             if (now - user.lastDaily < oneDay * 2) user.streak++; else user.streak = 1;
             const reward = 100 + (user.streak * 50);
             user.balance += reward;
+            user.totalAccountValue = calculateTotalValue(user);
             user.lastDaily = now;
             io.to(user.id).emit('current_user', user);
             io.to(user.id).emit('notification', { message: `Cadeau: +${reward} $ (Série: ${user.streak}j)` });
         } else {
-            io.to(user.id).emit('notification', { message: "Déjà récupéré aujourd'hui !" });
+            socket.emit('notification', { message: "Déjà récupéré aujourd'hui !" });
+        }
+    });
+
+    socket.on('gift_money', (data) => {
+        const target = users.find(u => u.id === data.targetId);
+        const amount = parseFloat(data.amount);
+        if (target && amount > 0 && user.balance >= amount) {
+            user.balance -= amount;
+            target.balance += amount;
+            user.totalAccountValue = calculateTotalValue(user);
+            target.totalAccountValue = calculateTotalValue(target);
+
+            io.to(user.id).emit('current_user', user);
+            io.to(target.id).emit('current_user', target);
+            io.to(target.id).emit('notification', { message: `${user.username} vous a envoyé ${amount} $ !` });
+            addLog("Transaction", `${user.username} a donné ${amount} $ à ${target.username}`);
+        }
+    });
+
+    socket.on('redeem_code', (data) => {
+        const codeObj = codes.find(c => c.code === data.code && c.uses > 0);
+        if (codeObj) {
+            codeObj.uses--;
+            user.balance += codeObj.reward;
+            user.totalAccountValue = calculateTotalValue(user);
+            io.to(user.id).emit('current_user', user);
+            socket.emit('notification', { message: `Code validé ! +${codeObj.reward} $` });
+        } else {
+            socket.emit('notification', { message: "Code invalide ou expiré." });
         }
     });
 
@@ -163,12 +215,23 @@ io.on('connection', (socket) => {
             if (product.stock !== -1) product.stock--;
             user.balance -= product.price;
             user.inventory.push(product.id);
-            user.xp += 50 * globalSettings.xpMultiplier;
+            user.totalAccountValue = calculateTotalValue(user);
 
+            // Gain XP
+            user.xp += 50 * globalSettings.xpMultiplier;
             if (user.xp >= user.level * 200) {
                 user.level++;
                 user.xp = 0;
-                io.to(user.id).emit('notification', { message: `Bravo ! Vous passez niveau ${user.level} !` });
+                io.to(user.id).emit('notification', { message: `BRAVO ! Niveau ${user.level} atteint !` });
+            }
+
+            // Notifier le vendeur
+            const seller = users.find(u => u.id === product.sellerId);
+            if (seller) {
+                seller.balance += product.price;
+                seller.totalAccountValue = calculateTotalValue(seller);
+                io.to(seller.id).emit('current_user', seller);
+                io.to(seller.id).emit('notification', { message: `Vente : ${user.username} a acheté ${product.name} !` });
             }
 
             io.to(user.id).emit('current_user', user);
