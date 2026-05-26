@@ -13,7 +13,7 @@ app.use(cors());
 app.use(express.json());
 
 // --- DATABASE SETUP ---
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://admin:admin@cluster.mongodb.net/economie?retryWrites=true&w=majority";
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://adsaka180_db_user:Elbereth2%23@cluster0.0glfahz.mongodb.net/economie?retryWrites=true&w=majority";
 mongoose.connect(MONGO_URI).then(() => console.log("🍃 MongoDB Connected")).catch(err => console.error("❌ DB Error:", err));
 
 const UserSchema = new mongoose.Schema({
