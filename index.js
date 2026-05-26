@@ -15,52 +15,13 @@ app.use(express.json());
 // --- DATABASE SETUP ---
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://adsaka180_db_user:Elbereth2%23@cluster0.0glfahz.mongodb.net/economie?retryWrites=true&w=majority";
 
-async function resetDatabase() {
-    try {
-        await User.deleteMany({});
-        await Product.deleteMany({});
-        await Auction.deleteMany({});
-        await Log.deleteMany({});
-        await Message.deleteMany({});
-        await Report.deleteMany({});
-
-        const hashedPassword = await bcrypt.hash("admin123", 10);
-        const admin = new User({
-            username: "admin",
-            password: hashedPassword,
-            balance: 1000000,
-            role: "SUPER_ADMIN",
-            level: 100,
-            reputation: 100,
-            title: "Fondateur",
-            statusMessage: "👑 Créateur de l'économie",
-            badges: ["🛡️ Staff", "💎 Fondateur"],
-            totalAccountValue: 1000000
-        });
-        await admin.save();
-
-        const welcomeProducts = [
-            { name: "Pack Fondateur", description: "Édition limitée pour le reset", price: 0, stock: -1, category: "Événement", sellerId: admin._id, sellerName: "Admin" },
-            { name: "Lingot d'Or", description: "Valeur refuge", price: 5000, stock: 100, category: "Ressources", sellerId: admin._id, sellerName: "Admin" }
-        ];
-        await Product.insertMany(welcomeProducts);
-
-        console.log("✅ BASE DE DONNÉES RÉINITIALISÉE : Seul l'admin existe.");
-    } catch(e) {
-        console.error("❌ Erreur reset :", e);
-    }
-}
-
-mongoose.connect(MONGO_URI).then(() => {
-    console.log("🍃 MongoDB Connected");
-    resetDatabase(); // Supprime tout et crée l'admin au démarrage
-}).catch(err => console.error("❌ DB Error:", err));
-
 const UserSchema = new mongoose.Schema({
     username: { type: String, unique: true, required: true },
     password: { type: String, required: true },
     balance: { type: Number, default: 1000 },
-    role: { type: String, default: 'USER' },
+    eventCurrency: { type: Number, default: 0 }, // Nouvelle monnaie événementielle
+    role: { type: String, default: 'USER' }, // USER, MODERATOR, ADMIN, SUPER_ADMIN
+    permissions: [String], // "can_ban", "can_edit_market", etc.
     level: { type: Number, default: 1 },
     xp: { type: Number, default: 0 },
     reputation: { type: Number, default: 0 },
@@ -76,21 +37,33 @@ const UserSchema = new mongoose.Schema({
     lastChest: { type: Number, default: 0 },
     totalAccountValue: { type: Number, default: 1000 },
     isBanned: { type: Boolean, default: false },
+    isShadowBanned: { type: Boolean, default: false },
+    isMuted: { type: Boolean, default: false },
+    canSell: { type: Boolean, default: true },
     lastSeen: { type: Number, default: Date.now },
-    status: { type: String, default: "offline" }
+    status: { type: String, default: "offline" },
+    lastIp: String,
+    deviceInfo: String,
+    loginHistory: [{ ip: String, timestamp: Number, device: String }]
 });
 
-UserSchema.set('toJSON', {
-    transform: (doc, ret) => {
-        ret.id = ret._id.toString();
-        delete ret._id;
-        delete ret.__v;
-        delete ret.password;
-        return ret;
-    }
+const GlobalSettingsSchema = new mongoose.Schema({
+    appName: { type: String, default: "Économie Virtuelle" },
+    currencySymbol: { type: String, default: "$" },
+    maintenanceMode: { type: Boolean, default: false },
+    emergencyMode: { type: Boolean, default: false },
+    globalTax: { type: Number, default: 0 }, // Taxe sur les ventes en %
+    buyingEnabled: { type: Boolean, default: true },
+    sellingEnabled: { type: Boolean, default: true },
+    marketTrend: { type: String, default: "Stable" },
+    primaryColor: { type: String, default: "#6200EE" },
+    themeMode: { type: String, default: "dark" },
+    minPrice: { type: Number, default: 1 },
+    maxPrice: { type: Number, default: 1000000 },
+    xpMultiplier: { type: Number, default: 1.0 },
+    registrationEnabled: { type: Boolean, default: true }
 });
-
-const User = mongoose.model('User', UserSchema);
+const GlobalSettings = mongoose.model('GlobalSettings', GlobalSettingsSchema);
 
 const ProductSchema = new mongoose.Schema({
     name: String,
@@ -102,19 +75,22 @@ const ProductSchema = new mongoose.Schema({
     sellerId: String,
     sellerName: String,
     isLimited: Boolean,
+    isFeatured: { type: Boolean, default: false },
+    rarity: { type: String, default: "COMMUN" }, // COMMUN, RARE, EPIC, LEGENDARY, ADMIN_ONLY
     createdAt: { type: Number, default: Date.now }
 });
 
-ProductSchema.set('toJSON', {
-    transform: (doc, ret) => {
-        ret.id = ret._id.toString();
-        delete ret._id;
-        delete ret.__v;
-        return ret;
-    }
+const TransactionSchema = new mongoose.Schema({
+    senderId: String,
+    senderName: String,
+    receiverId: String,
+    receiverName: String,
+    amount: Number,
+    details: String,
+    type: String, // PURCHASE, GIFT, ADMIN_ADJUST, CANCELLED
+    timestamp: { type: Number, default: Date.now }
 });
-
-const Product = mongoose.model('Product', ProductSchema);
+const Transaction = mongoose.model('Transaction', TransactionSchema);
 
 const AuctionSchema = new mongoose.Schema({
     productId: String,
@@ -191,47 +167,58 @@ ReportSchema.set('toJSON', {
     }
 });
 
-const Report = mongoose.model('Report', ReportSchema);
+// --- INITIALISATION ---
+let globalSettings = {};
 
-// --- GLOBAL STATE ---
-let globalSettings = {
-    appName: "Économie Virtuelle",
-    currencySymbol: "$",
-    defaultBalance: 1000,
-    xpMultiplier: 1.0,
-    registrationEnabled: true,
-    maintenanceMode: false,
-    economyEvent: "Normal",
-    marketTrend: "Stable"
-};
+async function initDatabase() {
+    try {
+        let settings = await GlobalSettings.findOne();
+        if (!settings) {
+            settings = new GlobalSettings();
+            await settings.save();
+        }
+        globalSettings = settings.toObject();
 
-const achievements = [
-    { id: "a1", name: "Premier Pas", description: "Faire son premier achat", icon: "🌱", xpReward: 100 },
-    { id: "a2", name: "Capitaliste", description: "Atteindre 10 000 $ de solde", icon: "💰", xpReward: 500 },
-    { id: "a3", name: "Vendeur Né", description: "Mettre son premier objet en vente", icon: "📦", xpReward: 200 }
-];
+        const adminExists = await User.findOne({ username: "admin" });
+        if (!adminExists) {
+            const hashedPassword = await bcrypt.hash("admin123", 10);
+            const admin = new User({
+                username: "admin",
+                password: hashedPassword,
+                balance: 1000000,
+                role: "SUPER_ADMIN",
+                level: 100,
+                reputation: 100,
+                title: "Fondateur",
+                statusMessage: "👑 Administrateur Suprême",
+                badges: ["🛡️ Staff", "💎 Fondateur"],
+                totalAccountValue: 1000000
+            });
+            await admin.save();
+            console.log("👑 Compte ADMIN créé.");
+        }
+        console.log("✅ Système initialisé.");
+    } catch(e) { console.error("❌ Erreur init :", e); }
+}
 
-const titles = [
-    { id: "t1", name: "Fondateur", rarity: "EXCLUSIF_ADMIN", color: "#FFD700", animation: "glow", icon: "👑" },
-    { id: "t2", name: "Nouveau", rarity: "COMMUN", color: "#FFFFFF", animation: "none", icon: "🌱" }
-];
-
-const codes = [
-    { code: "START", reward: 500, uses: 100 }
-];
+mongoose.connect(MONGO_URI).then(() => {
+    console.log("🍃 MongoDB Connected");
+    initDatabase();
+});
 
 // --- HELPERS ---
+async function addTransaction(data) {
+    const t = new Transaction(data);
+    await t.save();
+    const io = app.get('io');
+    if (io) io.to('admins').emit('new_transaction', t);
+}
+
 async function calculateTotalValue(user) {
     let inventoryValue = 0;
-    for (const prodId of user.inventory) {
-        try {
-            const p = await Product.findById(prodId);
-            if (p) {
-                const multiplier = getMarketMultiplier();
-                inventoryValue += (p.price * multiplier);
-            }
-        } catch(e) {}
-    }
+    const prods = await Product.find({ _id: { $in: user.inventory } });
+    const multiplier = getMarketMultiplier();
+    prods.forEach(p => inventoryValue += (p.price * multiplier));
     return user.balance + inventoryValue;
 }
 
@@ -241,6 +228,7 @@ function getMarketMultiplier() {
         case "Hausse": return 1.3;
         case "Baisse": return 0.7;
         case "Krak Boursier": return 0.3;
+        case "Apocalypse": return 0.1;
         default: return 1.0;
     }
 }
@@ -520,12 +508,49 @@ io.on('connection', async (socket) => {
         if (user.role !== 'USER') {
             const target = await User.findById(data.userId);
             if (target) {
-                target.balance += parseFloat(data.amount);
+                const oldBalance = target.balance;
+                target.balance = parseFloat(data.amount);
                 await target.save();
+
+                await addTransaction({
+                    senderId: user._id, senderName: "ADMIN",
+                    receiverId: target._id, receiverName: target.username,
+                    amount: target.balance - oldBalance,
+                    type: "ADMIN_ADJUST", details: "Ajustement manuel"
+                });
+
                 io.to(target._id.toString()).emit('current_user', target);
                 io.to('admins').emit('admin_user_updated', target);
-                addLog("Admin", `${user.username} a ajusté le solde de ${target.username} de ${data.amount}`, io);
+                addLog("Admin", `${user.username} a forcé le solde de ${target.username} à ${data.amount}`, io);
             }
+        }
+    });
+
+    socket.on('admin_reset_economy', async () => {
+        if (user.role === 'SUPER_ADMIN') {
+            await User.updateMany({ role: 'USER' }, { $set: { balance: 1000, inventory: [], eventCurrency: 0 } });
+            await Product.deleteMany({ sellerId: { $ne: user._id } });
+            io.emit('notification', { message: "☢️ RÉINITIALISATION DE L'ÉCONOMIE !" });
+            addLog("Admin", "RÉINITIALISATION TOTALE", io);
+        }
+    });
+
+    socket.on('admin_update_global_settings', async (data) => {
+        if (user.role === 'SUPER_ADMIN') {
+            let settings = await GlobalSettings.findOne();
+            if (!settings) settings = new GlobalSettings();
+            Object.assign(settings, data);
+            await settings.save();
+            globalSettings = settings.toObject();
+            io.emit('settings_updated', globalSettings);
+            addLog("Admin", "Paramètres système modifiés", io);
+        }
+    });
+
+    socket.on('admin_force_logout', (data) => {
+        if (user.role !== 'USER') {
+            io.to(data.userId).emit('banned');
+            addLog("Admin", `Déconnexion forcée de ${data.userId}`, io);
         }
     });
 
@@ -558,9 +583,11 @@ io.on('connection', async (socket) => {
     });
 
     socket.on('send_message', async (data) => {
+        if (user.isMuted) return socket.emit('notification', { message: "Vous êtes réduit au silence !" });
         const msg = new Message({ senderId: user._id, senderName: user.username, content: data.content });
         await msg.save();
-        io.emit('new_message', msg);
+        if (!user.isShadowBanned) io.emit('new_message', msg);
+        else socket.emit('new_message', msg); // Ne voit que son message
     });
 
     socket.on('report_user', async (data) => {
