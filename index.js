@@ -28,6 +28,14 @@ function keepAlive() {
     }, 10 * 60 * 1000); // Ping toutes les 10 minutes
 }
 
+// --- MARKET TRENDS AUTOMATION ---
+setInterval(() => {
+    const trends = ["Stable", "Hausse", "Baisse", "Inflation", "Krak Boursier"];
+    globalSettings.marketTrend = trends[Math.floor(Math.random() * trends.length)];
+    io.emit('settings_updated', globalSettings);
+    io.emit('notification', { message: `La météo économique a changé : ${globalSettings.marketTrend} !` });
+}, 30 * 60 * 1000); // Toutes les 30 minutes
+
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
@@ -61,6 +69,8 @@ let reports = [];
 let codes = [
     { code: "START", reward: 500, uses: 100 }
 ];
+let auctions = []; // { id, productId, sellerId, highestBid, highestBidderId, endTime }
+let friends = []; // { user1Id, user2Id, status: 'pending' | 'accepted' }
 let titles = [
     { id: "t1", name: "Fondateur", rarity: "EXCLUSIF_ADMIN", color: "#FFD700", animation: "glow", icon: "👑" },
     { id: "t2", name: "Nouveau", rarity: "COMMUN", color: "#FFFFFF", animation: "none", icon: "🌱" }
@@ -150,6 +160,9 @@ io.on('connection', (socket) => {
     });
 
     if (user.role !== 'USER') socket.emit('admin_data', { users, logs, transactions, reports });
+
+    // --- ENCHÈRES & TENDANCES ---
+    socket.emit('market_data', { trend: globalSettings.marketTrend, auctions });
 
     // --- ACTIONS JOUEURS ---
     socket.on('update_status', (data) => {
@@ -334,6 +347,45 @@ io.on('connection', (socket) => {
                 io.to(target.id).emit('current_user', target);
                 addLog("Admin", `Badge ${data.badge} donné à ${target.username}`);
             }
+        }
+    });
+
+    socket.on('add_friend', (data) => {
+        const target = users.find(u => u.id === data.targetId);
+        if (target && target.id !== user.id) {
+            friends.push({ user1Id: user.id, user2Id: target.id, status: 'pending' });
+            io.to(target.id).emit('notification', { message: `${user.username} vous a envoyé une demande d'ami !` });
+            socket.emit('notification', { message: "Demande envoyée !" });
+        }
+    });
+
+    socket.on('start_auction', (data) => {
+        const product = products.find(p => p.id === data.productId && p.sellerId === user.id);
+        if (product) {
+            const auction = {
+                id: uuidv4(),
+                productId: product.id,
+                productName: product.name,
+                sellerId: user.id,
+                sellerName: user.username,
+                highestBid: product.price,
+                highestBidderId: null,
+                endTime: Date.now() + (data.durationMinutes * 60000)
+            };
+            auctions.push(auction);
+            io.emit('new_auction', auction);
+            addLog("Market", `${user.username} a lancé une enchère pour ${product.name}`);
+        }
+    });
+
+    socket.on('bid_auction', (data) => {
+        const auction = auctions.find(a => a.id === data.auctionId);
+        const bid = parseFloat(data.amount);
+        if (auction && bid > auction.highestBid && user.balance >= bid) {
+            auction.highestBid = bid;
+            auction.highestBidderId = user.id;
+            auction.highestBidderName = user.username;
+            io.emit('auction_update', auction);
         }
     });
 
