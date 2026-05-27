@@ -683,11 +683,42 @@ io.on('connection', async (socket) => {
         }
     });
 
-    socket.on('super_admin_update_settings', (data) => {
+    socket.on('super_admin_update_settings', async (data) => {
         if (user.role === 'SUPER_ADMIN') {
-            Object.assign(globalSettings, data);
+            let settings = await GlobalSettings.findOne();
+            if (!settings) settings = new GlobalSettings();
+            Object.assign(settings, data);
+            await settings.save();
+            globalSettings = settings.toObject();
             io.emit('settings_updated', globalSettings);
-            addLog("Admin", "Paramètres globaux mis à jour", io);
+            addLog("Admin", "Paramètres système mis à jour", io);
+        }
+    });
+
+    socket.on('super_admin_modify_user', async (data) => {
+        if (user.role === 'SUPER_ADMIN') {
+            const target = await User.findById(data.userId);
+            if (target) {
+                Object.assign(target, data.updates);
+                await target.save();
+                io.to(target._id.toString()).emit('current_user', target);
+                io.to('admins').emit('admin_user_updated', target);
+                addLog("Admin", `Utilisateur ${target.username} modifié par l'administrateur`, io);
+            }
+        }
+    });
+
+    socket.on('admin_manage_title', async (data) => {
+        if (user.role === 'SUPER_ADMIN') {
+            if (data.action === 'assign') {
+                const target = await User.findById(data.userId);
+                if (target) {
+                    target.title = data.titleName; // or titleId mapping
+                    await target.save();
+                    io.to(target._id.toString()).emit('current_user', target);
+                    addLog("Admin", `Titre ${target.title} assigné à ${target.username}`, io);
+                }
+            }
         }
     });
 
