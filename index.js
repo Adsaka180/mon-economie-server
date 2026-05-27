@@ -179,6 +179,11 @@ ReportSchema.set('toJSON', {
 // --- INITIALISATION ---
 let globalSettings = {};
 
+const welcomeProducts = [
+    { name: "Pack Fondateur", description: "Édition limitée pour le reset", price: 0, stock: -1, category: "Événement", isLimited: true },
+    { name: "Lingot d'Or", description: "Valeur refuge", price: 5000, stock: 100, category: "Ressources", isLimited: false }
+];
+
 async function initDatabase() {
     try {
         let settings = await GlobalSettings.findOne();
@@ -205,6 +210,11 @@ async function initDatabase() {
             });
             await admin.save();
             console.log("👑 Compte ADMIN créé.");
+
+            for (const p of welcomeProducts) {
+                const prod = new Product({ ...p, sellerId: admin._id, sellerName: "Admin" });
+                await prod.save();
+            }
         }
         console.log("✅ Système initialisé.");
     } catch(e) { console.error("❌ Erreur init :", e); }
